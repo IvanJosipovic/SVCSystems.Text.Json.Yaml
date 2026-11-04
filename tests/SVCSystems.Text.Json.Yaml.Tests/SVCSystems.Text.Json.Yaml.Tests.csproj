@@ -5,6 +5,8 @@
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Cancellation tests deliberately pass pre-cancelled tokens. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
     <!-- Tests intentionally exercise the reflection based overloads outside of AOT. -->
     <NoWarn Condition="'$(Configuration)' == 'Aot'">$(NoWarn);IL2026;IL3050</NoWarn>
     <!-- Publish the test suite as a Native AOT application with `dotnet publish -c Aot`. -->

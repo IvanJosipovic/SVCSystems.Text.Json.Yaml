@@ -282,6 +282,18 @@ using var output = File.Create("out.yaml");
 YamlSerializer.Serialize(output, config, ConfigJsonContext.Default.Config);
 ```
 
+Asynchronous variants perform stream I/O asynchronously and honor a
+`CancellationToken` (parsing and object serialization are synchronous CPU work performed after
+the I/O completes):
+
+```csharp
+using var file = File.OpenRead("config.yaml");
+var config = await YamlSerializer.DeserializeAsync(file, ConfigJsonContext.Default.Config, cancellationToken: ct);
+
+using var output = File.Create("out.yaml");
+await YamlSerializer.SerializeAsync(output, config, ConfigJsonContext.Default.Config, cancellationToken: ct);
+```
+
 ## Known limitations
 
 - Comments and YAML formatting (quoting styles, indentation, anchors) are not preserved on round

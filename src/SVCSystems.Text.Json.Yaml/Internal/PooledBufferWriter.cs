@@ -24,6 +24,8 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
 
     public Span<byte> WrittenSpan => _buffer.AsSpan(0, _written);
 
+    public Memory<byte> WrittenMemory => _buffer.AsMemory(0, _written);
+
     public void Advance(int count)
     {
         if (_written + count > _buffer.Length)

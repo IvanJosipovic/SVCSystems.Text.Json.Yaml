@@ -567,6 +567,92 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
+    public async Task SupportsAsyncStreamOverloads()
+    {
+        var person = new Person { Name = "John", Age = 30 };
+
+        using var serializeStream = new MemoryStream();
+        await YamlSerializer.SerializeAsync(serializeStream, person, AppJsonContext.Default.Person);
+        serializeStream.Flush();
+
+        serializeStream.Position = 0;
+        using var reader = new StreamReader(serializeStream, leaveOpen: true);
+        reader.ReadToEnd().ShouldBe("Name: John" + Environment.NewLine + "Age: 30" + Environment.NewLine);
+
+        serializeStream.Position = 0;
+        var result = await YamlSerializer.DeserializeAsync(serializeStream, AppJsonContext.Default.Person);
+
+        result.ShouldNotBeNull();
+        result.Name.ShouldBe("John");
+        result.Age.ShouldBe(30);
+    }
+
+    [Fact]
+    public async Task AsyncOverloadsLeaveTheStreamOpen()
+    {
+        var person = new Person { Name = "John", Age = 30 };
+
+        using var stream = new MemoryStream();
+        await YamlSerializer.SerializeAsync(stream, person, AppJsonContext.Default.Person);
+
+        stream.CanWrite.ShouldBeTrue();
+
+        stream.Position = 0;
+        await YamlSerializer.DeserializeAsync(stream, AppJsonContext.Default.Person);
+
+        stream.CanRead.ShouldBeTrue();
+    }
+
+    [Fact]
+    public async Task AsyncOverloadsHandleUtf8BomAndLargePayloads()
+    {
+        var large = new string('x', 128 * 1024);
+        var model = new Dictionary<string, string> { ["text"] = large };
+
+        using var serializeStream = new MemoryStream();
+        await YamlSerializer.SerializeAsync(serializeStream, model, AppJsonContext.Default.DictionaryStringString);
+        serializeStream.Flush();
+
+        serializeStream.Position = 0;
+        var result = await YamlSerializer.DeserializeAsync(serializeStream, AppJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["text"].ShouldBe(large);
+    }
+
+    [Fact]
+    public async Task AsyncOverloadsHonorCancellationToken()
+    {
+        var person = new Person { Name = "John", Age = 30 };
+
+        using var serializeStream = new MemoryStream();
+
+        // Deliberately passing a pre-cancelled token to verify cancellation is honored.
+#pragma warning disable xUnit1051
+        await Should.ThrowAsync<OperationCanceledException>(() =>
+            YamlSerializer.SerializeAsync(serializeStream, person, AppJsonContext.Default.Person, null, new CancellationToken(canceled: true)));
+
+        using var deserializeStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("Name: John" + Environment.NewLine));
+
+        await Should.ThrowAsync<OperationCanceledException>(() =>
+            YamlSerializer.DeserializeAsync(deserializeStream, AppJsonContext.Default.Person, null, new CancellationToken(canceled: true)));
+#pragma warning restore xUnit1051
+    }
+
+    [Fact]
+    public async Task MaxInputLengthIsEnforcedOnTheAsyncOverload()
+    {
+        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
+
+        using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("Name: a-value-longer-than-ten\nAge: 1\n"));
+
+        var exception = await Should.ThrowAsync<YamlException>(() =>
+            YamlSerializer.DeserializeAsync(stream, AppJsonContext.Default.Person, yamlOptions));
+
+        exception.Message.ShouldContain("maximum input length");
+    }
+
+    [Fact]
     public void RejectsNullTypeInfo()
     {
         Should.Throw<ArgumentNullException>(() => YamlSerializer.Serialize(new Person(), (JsonTypeInfo<Person>)null!));

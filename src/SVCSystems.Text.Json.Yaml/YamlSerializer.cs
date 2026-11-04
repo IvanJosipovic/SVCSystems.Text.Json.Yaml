@@ -383,6 +383,122 @@ public static class YamlSerializer
 
     #endregion
 
+    #region Asynchronous APIs
+
+    /// <summary>
+    /// Serializes the specified value as YAML to the provided stream asynchronously using the
+    /// provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// The stream write is asynchronous and honors <paramref name="cancellationToken"/>. Object
+    /// serialization and YAML conversion are synchronous CPU work.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="stream">The stream to write YAML to. The stream is not closed or disposed.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <param name="cancellationToken">A token that cancels the stream write.</param>
+    /// <returns>A task that completes when the YAML has been written.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
+    public static async Task SerializeAsync<T>(Stream stream, T value, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+
+        var jsonBuffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var writer = new Utf8JsonWriter(jsonBuffer))
+            {
+                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
+            }
+
+            var yamlBuffer = new PooledBufferWriter();
+
+            try
+            {
+                using (var streamWriter = new StreamWriter(new PooledBufferStream(yamlBuffer), JsonToYamlConverter.Utf8NoBom, bufferSize: 1024, leaveOpen: true))
+                {
+                    JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, streamWriter, yamlOptions);
+                }
+
+                await stream.WriteAsync(yamlBuffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                yamlBuffer.Dispose();
+            }
+        }
+        finally
+        {
+            jsonBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deserializes a YAML stream into an instance of type <typeparamref name="T"/> using the
+    /// provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// The stream read is asynchronous and honors <paramref name="cancellationToken"/>. YAML
+    /// parsing and object deserialization are synchronous CPU work performed after the stream has
+    /// been read.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="stream">The stream to read YAML from. The stream is not closed or disposed.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <param name="cancellationToken">A token that cancels the stream read.</param>
+    /// <returns>A task that completes with an instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    public static async Task<T?> DeserializeAsync<T>(Stream stream, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+
+        var yamlBuffer = new PooledBufferWriter();
+
+        try
+        {
+            await stream.CopyToAsync(new PooledBufferStream(yamlBuffer), cancellationToken).ConfigureAwait(false);
+
+            var yaml = Encoding.UTF8.GetString(yamlBuffer.WrittenSpan);
+
+            if (yaml.Length > 0 && yaml[0] == '\uFEFF')
+            {
+                yaml = yaml[1..];
+            }
+
+            ValidateInputLength(yaml, yamlOptions);
+
+            var buffer = new PooledBufferWriter();
+
+            try
+            {
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    var parser = CreateParser(yaml, yamlOptions);
+                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                }
+
+                return JsonSerializer.Deserialize(buffer.WrittenSpan, jsonTypeInfo);
+            }
+            finally
+            {
+                buffer.Dispose();
+            }
+        }
+        finally
+        {
+            yamlBuffer.Dispose();
+        }
+    }
+
+    #endregion
+
     private static IParser CreateParser(string yaml, YamlSerializerOptions? yamlOptions)
     {
         return CreateParser(new StringReader(yaml), yamlOptions);
