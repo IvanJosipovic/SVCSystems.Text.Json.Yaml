@@ -231,6 +231,9 @@ Explicitly rejected with a descriptive error (including line/column where possib
 ## Known limitations
 
 - The JSON compatible subset of YAML is supported; arbitrary YAML documents may be rejected.
+  The path to full [YAML 1.2.2](https://yaml.org/spec/1.2.2/) compatibility is planned in
+  [docs/yaml-1.2-compat-plan.md](docs/yaml-1.2-compat-plan.md) (multi-document streams,
+  anchors/aliases, merge keys, tag policies, scalar schemas, comments).
 - YAML formatting is not preserved on round trips (comments, quoting styles, anchor/alias graphs).
 - Intermediate JSON is buffered; the reflection based overloads need runtime reflection.
 - YamlDotNet's emitter escapes some non-ASCII scalars (for example emoji) using double quoted
