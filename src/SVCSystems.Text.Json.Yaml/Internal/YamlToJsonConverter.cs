@@ -329,6 +329,7 @@ internal static class YamlToJsonConverter
         }
 
         context.PopMapping();
+        context.ExitCollection();
         writer.WriteEndObject();
     }
 

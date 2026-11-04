@@ -41,9 +41,23 @@ internal static class JsonToYamlConverter
 
     public static string ConvertToString(ReadOnlySpan<byte> utf8Json, YamlSerializerOptions? options = null)
     {
-        var writer = new StringWriter();
-        Convert(utf8Json, writer, options);
-        return writer.ToString();
+        // The emitter writes into pooled UTF-8 buffers; a StringWriter/StringBuilder would double
+        // the allocation profile of every emitted document.
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            using var stream = new PooledBufferStream(buffer);
+            using var writer = new StreamWriter(stream, Utf8NoBom, bufferSize: 1024, leaveOpen: true);
+            Convert(utf8Json, writer, options);
+            writer.Flush();
+
+            return Encoding.UTF8.GetString(buffer.WrittenSpan);
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
     }
 
     public static void Convert(ReadOnlySpan<byte> utf8Json, TextWriter output, YamlSerializerOptions? options = null)

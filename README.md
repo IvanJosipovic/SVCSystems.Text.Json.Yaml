@@ -318,16 +318,17 @@ serialization = 1.00):
 
 | Scenario | Serialize time | Serialize alloc | Deserialize time | Deserialize alloc |
 |---|---|---|---|---|
-| Small config (6 properties) | 0.29x (contracts) | 0.28x | 0.64x | 0.82x |
-| Kubernetes manifest (10 containers) | 0.35x | 0.47x | 0.70x | 0.97x |
-| 1,000 item list | 0.29x | 0.44x | 0.62x | 0.94x |
-| 64 KB scalar document | 1.07x | 1.42x | 0.78x | 1.44x |
+| Small config (6 properties) | 0.31x (contracts) | 0.35x | 0.65x | 0.84x |
+| Kubernetes manifest (10 containers) | 0.38x | 0.44x | 0.63x | 0.98x |
+| 1,000 item list | 0.36x | 0.40x | 0.66x | 0.95x |
+| 64 KB scalar document | 0.97x | 0.93x | 0.72x | 1.44x |
 
 Reflection mode tracks the source generated mode closely (within ~5-10%). The token bridge is
-faster and allocates less than YamlDotNet's reflection based object engine for structured data;
-for a single large scalar the YamlDotNet emitter path is competitive and the extra buffering of
-this pipeline shows in the allocations. This is the main optimization target for the streaming
-work.
+faster and allocates less than YamlDotNet's reflection based object engine for structured data.
+Emitter output is encoded directly into pooled UTF-8 buffers (no intermediate `StringBuilder`).
+The one remaining deficit is deserialize allocations for a single large scalar, which is
+YamlDotNet scanner-internal (it materializes the scalar as a UTF-16 string while scanning) and
+is therefore only addressable by the UTF-8 native front-end work.
 
 ## Building from source
 

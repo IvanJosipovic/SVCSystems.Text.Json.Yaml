@@ -236,6 +236,24 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void SiblingCollectionsDoNotAccumulateNestingDepth()
+    {
+        // Regression: mappings did not decrement the depth counter, so any document with more
+        // than MaxDepth sibling collections (for example a large list of objects) was rejected.
+        var builder = new System.Text.StringBuilder();
+        for (var i = 0; i < 200; i++)
+        {
+            builder.Append("- id: ").Append(i).AppendLine();
+            builder.AppendLine("  name: item");
+        }
+
+        var element = YamlSerializer.Deserialize(builder.ToString(), TestJsonContext.Default.JsonElement);
+
+        element.GetArrayLength().ShouldBe(200);
+        element[199].GetProperty("id").GetInt32().ShouldBe(199);
+    }
+
+    [Fact]
     public void SupportsBlockScalars()
     {
         var json = ConvertToJson("""
