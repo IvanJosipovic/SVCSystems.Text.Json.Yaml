@@ -1,5 +1,9 @@
 # SVCSystems.Text.Json.Yaml
 
+[![Nuget](https://img.shields.io/nuget/vpre/SVCSystems.Text.Json.Yaml.svg?style=flat-square)](https://www.nuget.org/packages/SVCSystems.Text.Json.Yaml)
+[![Nuget)](https://img.shields.io/nuget/dt/SVCSystems.Text.Json.Yaml.svg?style=flat-square)](https://www.nuget.org/packages/SVCSystems.Text.Json.Yaml)
+[![codecov](https://codecov.io/gh/IvanJosipovic/SVCSystems.Text.Json.Yaml/branch/main/graph/badge.svg)](https://codecov.io/gh/IvanJosipovic/SVCSystems.Text.Json.Yaml)
+
 YAML serialization and deserialization for .NET powered by the existing `System.Text.Json`
 serialization infrastructure.
 
