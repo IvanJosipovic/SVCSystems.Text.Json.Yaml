@@ -252,6 +252,24 @@ dotnet run --project benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks -c Release 
 Correctness and compatibility were prioritized over micro-optimization; streaming and zero-copy
 conversion paths are future work.
 
+### Recorded results
+
+BenchmarkDotNet `ShortRun`, linux-x64, .NET 11 (times relative to YamlDotNet reflection
+serialization = 1.00):
+
+| Scenario | Serialize time | Serialize alloc | Deserialize time | Deserialize alloc |
+|---|---|---|---|---|
+| Small config (6 properties) | 0.29x (contracts) | 0.28x | 0.64x | 0.82x |
+| Kubernetes manifest (10 containers) | 0.35x | 0.47x | 0.70x | 0.97x |
+| 1,000 item list | 0.29x | 0.44x | 0.62x | 0.94x |
+| 64 KB scalar document | 1.07x | 1.42x | 0.78x | 1.44x |
+
+Reflection mode tracks the source generated mode closely (within ~5-10%). The token bridge is
+faster and allocates less than YamlDotNet's reflection based object engine for structured data;
+for a single large scalar the YamlDotNet emitter path is competitive and the extra buffering of
+this pipeline shows in the allocations. This is the main optimization target for the streaming
+work.
+
 ## Building from source
 
 ```sh
