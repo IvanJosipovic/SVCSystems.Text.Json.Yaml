@@ -23,6 +23,7 @@ public partial class YamlSerializerOptionsTests
     [JsonSerializable(typeof(UpperCaseModel))]
     [JsonSerializable(typeof(Dictionary<string, List<int>>))]
     [JsonSerializable(typeof(Dictionary<string, Dictionary<string, int>>))]
+    [JsonSerializable(typeof(Dictionary<string, string>))]
     internal sealed partial class OptionsJsonContext : JsonSerializerContext;
 
     public sealed class UpperCaseModel
@@ -203,5 +204,130 @@ public partial class YamlSerializerOptionsTests
         new YamlSerializerOptions().EmitDocumentStart.ShouldBeFalse();
         new YamlSerializerOptions().UseFlowStyle.ShouldBeFalse();
         new YamlSerializerOptions().AllowDuplicateKeys.ShouldBeFalse();
+        new YamlSerializerOptions().Width.ShouldBe(80);
+        new YamlSerializerOptions().MaxSimpleKeyLength.ShouldBe(128);
+        new YamlSerializerOptions().IndentedSequences.ShouldBeFalse();
+        new YamlSerializerOptions().StringStyle.ShouldBe(YamlStringStyle.Auto);
+    }
+
+    [Fact]
+    public void EmitterOptionsAreValidated()
+    {
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { Width = 0 });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { MaxSimpleKeyLength = 0 });
+        Should.Throw<ArgumentException>(() => new YamlSerializerOptions { NewLine = "" });
+        Should.Throw<ArgumentException>(() => new YamlSerializerOptions { NewLine = null! });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { StringStyle = (YamlStringStyle)42 });
+    }
+
+    [Fact]
+    public void WidthFoldsLongPlainScalars()
+    {
+        var yamlOptions = new YamlSerializerOptions { Width = 20 };
+        var model = new Dictionary<string, string> { ["text"] = "aaaaaaaaaa bbbbbbbbbb cccccccccc" };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
+
+        // The emitter folds the long plain scalar at the configured width; the value must
+        // round trip exactly.
+        yaml.ShouldNotContain("aaaaaaaaaa bbbbbbbbbb cccccccccc");
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["text"].ShouldBe("aaaaaaaaaa bbbbbbbbbb cccccccccc");
+    }
+
+    [Fact]
+    public void NewLineControlsTheLineBreakSequence()
+    {
+        var yamlOptions = new YamlSerializerOptions { NewLine = "\r\n" };
+        var model = new Dictionary<string, string> { ["a"] = "1", ["b"] = "2" };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
+
+        yaml.ShouldContain("\r\n");
+        yaml.ReplaceLineEndings().ShouldBe(yaml.ReplaceLineEndings("\r\n"));
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["a"].ShouldBe("1");
+    }
+
+    [Fact]
+    public void LongKeysAreEmittedAsExplicitKeys()
+    {
+        var longKey = new string('k', 40);
+        var yamlOptions = new YamlSerializerOptions { MaxSimpleKeyLength = 20 };
+        var model = new Dictionary<string, string> { [longKey] = "value" };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
+
+        yaml.ShouldContain("? " + longKey);
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result[longKey].ShouldBe("value");
+    }
+
+    [Fact]
+    public void IndentedSequencesIndentDashEntries()
+    {
+        var yamlOptions = new YamlSerializerOptions { IndentedSequences = true };
+        var model = new Dictionary<string, List<int>> { ["values"] = [1, 2] };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringListInt32, yamlOptions);
+
+        yaml.ReplaceLineEndings("\n").ShouldBe("values:\n  - 1\n  - 2\n");
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringListInt32);
+
+        result.ShouldNotBeNull();
+        result["values"].ShouldBe([1, 2]);
+    }
+
+    [Fact]
+    public void DoubleQuotedStringStyleQuotesAllStrings()
+    {
+        var yamlOptions = new YamlSerializerOptions { StringStyle = YamlStringStyle.DoubleQuoted };
+        var model = new Dictionary<string, string> { ["key"] = "hello" };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
+
+        yaml.ReplaceLineEndings("\n").ShouldBe("\"key\": \"hello\"\n");
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["key"].ShouldBe("hello");
+    }
+
+    [Fact]
+    public void LiteralStringStyleUsesBlockScalarsForValues()
+    {
+        var yamlOptions = new YamlSerializerOptions { StringStyle = YamlStringStyle.Literal };
+        var model = new Dictionary<string, string> { ["key"] = "hello" };
+
+        var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
+
+        yaml.ReplaceLineEndings("\n").ShouldBe("key: |-\n  hello\n");
+
+        var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["key"].ShouldBe("hello");
+    }
+
+    [Fact]
+    public void MaxInputLengthIsEnforcedOnTheStreamOverload()
+    {
+        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
+
+        using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("Name: a-value-longer-than-ten\nAge: 1\n"));
+
+        Should.Throw<YamlDotNet.Core.YamlException>(() => YamlSerializer.Deserialize(stream, OptionsJsonContext.Default.NamedModel, yamlOptions))
+            .Message.ShouldContain("maximum input length");
     }
 }

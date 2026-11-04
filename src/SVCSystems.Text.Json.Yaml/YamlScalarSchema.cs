@@ -63,3 +63,28 @@ public enum UnknownTagBehavior
     /// </summary>
     Ignore = 1,
 }
+
+/// <summary>
+/// Defines the preferred style for emitted string scalars.
+/// </summary>
+public enum YamlStringStyle
+{
+    /// <summary>
+    /// The emitter decides: multi line strings become literal blocks, strings that a YAML parser
+    /// could misread as numbers, booleans or null are quoted, and everything else is plain
+    /// (the default).
+    /// </summary>
+    Auto = 0,
+
+    /// <summary>
+    /// String values are emitted as literal block scalars (<c>|</c>), which preserves their exact
+    /// content including line breaks. Mapping keys remain single line and use the
+    /// <see cref="Auto"/> rules.
+    /// </summary>
+    Literal = 1,
+
+    /// <summary>
+    /// All strings (values and keys) are emitted double quoted, producing a JSON-like appearance.
+    /// </summary>
+    DoubleQuoted = 2,
+}

@@ -312,7 +312,8 @@ public static class YamlSerializer
             using (var writer = new Utf8JsonWriter(buffer))
             {
                 using var reader = new StreamReader(stream, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 1024, leaveOpen: true);
-                var parser = CreateParser(reader, yamlOptions);
+                var input = new LengthCheckingTextReader(reader, yamlOptions?.MaxInputLength ?? 0);
+                var parser = CreateParser(input, yamlOptions);
                 YamlToJsonConverter.Convert(parser, writer, yamlOptions);
             }
 

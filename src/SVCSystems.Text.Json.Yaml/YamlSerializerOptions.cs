@@ -28,6 +28,12 @@ public sealed class YamlSerializerOptions
     /// <summary>The default maximum number of documents per call.</summary>
     internal const int DefaultMaxDocuments = 16;
 
+    /// <summary>The default preferred line width of the emitter.</summary>
+    internal const int DefaultWidth = 80;
+
+    /// <summary>The default maximum length of a simple (single line) mapping key.</summary>
+    internal const int DefaultMaxSimpleKeyLength = 128;
+
     private int _indentation = DefaultIndentation;
     private YamlScalarSchema _scalarSchema = YamlScalarSchema.Core;
     private int _maxDepth = DefaultMaxDepth;
@@ -35,6 +41,9 @@ public sealed class YamlSerializerOptions
     private int _maxScalarLength;
     private int _maxAliasExpansionEvents = DefaultMaxAliasExpansionEvents;
     private int _maxDocuments = DefaultMaxDocuments;
+    private int _width = DefaultWidth;
+    private int _maxSimpleKeyLength = DefaultMaxSimpleKeyLength;
+    private string _newLine = Environment.NewLine;
 
     /// <summary>
     /// Gets or sets the number of spaces used to indent nested block collections. Valid values are
@@ -219,6 +228,77 @@ public sealed class YamlSerializerOptions
     }
 
     /// <summary>
+    /// Gets or sets the preferred line width in characters before the emitter folds long
+    /// scalars. Must be at least 1. The default is 80.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is less than 1.</exception>
+    public int Width
+    {
+        get => _width;
+        set
+        {
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Width must be at least 1.");
+            }
+
+            _width = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the maximum length of a mapping key that may be written as a simple (single
+    /// line) key; longer keys are written as explicit <c>? key</c> entries. Must be at least 1.
+    /// The default is 128.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is less than 1.</exception>
+    public int MaxSimpleKeyLength
+    {
+        get => _maxSimpleKeyLength;
+        set
+        {
+            if (value < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "MaxSimpleKeyLength must be at least 1.");
+            }
+
+            _maxSimpleKeyLength = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the line break sequence used by the emitter. The default is
+    /// <see cref="Environment.NewLine"/>.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the value is null or empty.</exception>
+    public string NewLine
+    {
+        get => _newLine;
+        set
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                throw new ArgumentException("The newline sequence must not be null or empty.", nameof(value));
+            }
+
+            _newLine = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether block sequence entries are indented relative to
+    /// their parent mapping key. The default is <see langword="false"/> (YamlDotNet's "indentless"
+    /// sequences, which are valid YAML but visually aligned with the key).
+    /// </summary>
+    public bool IndentedSequences { get; set; }
+
+    /// <summary>
+    /// Gets or sets the preferred style for emitted string scalars. The default is
+    /// <see cref="YamlStringStyle.Auto"/>.
+    /// </summary>
+    public YamlStringStyle StringStyle { get; set; }
+
+    /// <summary>
     /// Creates a copy of the options with the same values.
     /// </summary>
     internal YamlSerializerOptions Clone()
@@ -240,6 +320,11 @@ public sealed class YamlSerializerOptions
             MaxScalarLength = MaxScalarLength,
             MaxAliasExpansionEvents = MaxAliasExpansionEvents,
             MaxDocuments = MaxDocuments,
+            Width = Width,
+            MaxSimpleKeyLength = MaxSimpleKeyLength,
+            NewLine = NewLine,
+            IndentedSequences = IndentedSequences,
+            StringStyle = StringStyle,
         };
     }
 }
