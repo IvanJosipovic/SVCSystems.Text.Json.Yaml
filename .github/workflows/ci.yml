@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  build-test:
+    name: Build, test & pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+
+      - name: Build
+        run: dotnet build SVCSystems.Text.Json.Yaml.slnx
+
+      - name: Test
+        run: dotnet run --project tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj -c Debug
+
+      - name: Pack
+        run: dotnet pack src/SVCSystems.Text.Json.Yaml/SVCSystems.Text.Json.Yaml.csproj -c Release -o artifacts/package
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: artifacts/package
+
+  aot-tests:
+    name: Native AOT
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+
+      # Publish the xUnit suite as a Native AOT application. The suite only uses source
+      # generated contracts, so it must succeed without any reflection fallback.
+      - name: Restore (AOT configuration)
+        run: dotnet restore tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj -p:Configuration=Aot -r linux-x64
+
+      - name: Publish tests (AOT)
+        run: dotnet publish tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj -c Aot -f net11.0 -r linux-x64 --self-contained true --no-restore -o artifacts/aot-tests
+
+      - name: Run tests (AOT)
+        run: ./artifacts/aot-tests/SVCSystems.Text.Json.Yaml.Tests
+
+      - name: Publish AOT validation app
+        run: dotnet publish tests/SVCSystems.Text.Json.Yaml.AotTests/SVCSystems.Text.Json.Yaml.AotTests.csproj -c Release -f net11.0 -r linux-x64 -o artifacts/aot-app
+
+      - name: Run AOT validation app
+        run: ./artifacts/aot-app/SVCSystems.Text.Json.Yaml.AotTests

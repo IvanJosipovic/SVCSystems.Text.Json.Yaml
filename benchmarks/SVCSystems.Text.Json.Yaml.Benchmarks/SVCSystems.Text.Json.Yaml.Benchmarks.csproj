@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <NoWarn>$(NoWarn);CA1869</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.16.0-preview.2" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SVCSystems.Text.Json.Yaml\SVCSystems.Text.Json.Yaml.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!--
+    Simulates a third party library that ships its own source generated
+    JsonSerializerContext. The test project must be able to serialize and
+    deserialize these types with YamlSerializer without modifying or
+    regenerating the context.
+  -->
+
+</Project>
