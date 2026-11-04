@@ -247,7 +247,8 @@ public partial class YamlSerializerOptionsTests
         var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringString, yamlOptions);
 
         yaml.ShouldContain("\r\n");
-        yaml.ReplaceLineEndings().ShouldBe(yaml.ReplaceLineEndings("\r\n"));
+        // Every line break must be the configured sequence.
+        yaml.Replace("\r\n", "").ShouldNotContain("\n");
 
         var result = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString);
 

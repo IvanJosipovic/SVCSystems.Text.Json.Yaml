@@ -292,11 +292,26 @@ public sealed class YamlSerializerOptions
     /// </summary>
     public bool IndentedSequences { get; set; }
 
+    private YamlStringStyle _stringStyle;
+
     /// <summary>
     /// Gets or sets the preferred style for emitted string scalars. The default is
     /// <see cref="YamlStringStyle.Auto"/>.
     /// </summary>
-    public YamlStringStyle StringStyle { get; set; }
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is not a defined <see cref="YamlStringStyle"/>.</exception>
+    public YamlStringStyle StringStyle
+    {
+        get => _stringStyle;
+        set
+        {
+            if (!Enum.IsDefined(value))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "The string style is not valid.");
+            }
+
+            _stringStyle = value;
+        }
+    }
 
     /// <summary>
     /// Creates a copy of the options with the same values.

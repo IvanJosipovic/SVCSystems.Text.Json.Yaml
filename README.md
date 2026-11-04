@@ -95,10 +95,15 @@ public sealed class YamlSerializerOptions
     public bool AllowBinaryTag { get; set; }           // accept '!!binary' as a base64 string
     public bool AllowTimestampTag { get; set; }        // accept '!!timestamp' as a string
     public int MaxDepth { get; set; } = 64;            // nesting limit
-    public int MaxInputLength { get; set; }            // 0: unlimited
+    public int MaxInputLength { get; set; }            // 0: unlimited; enforced on string and stream inputs
     public int MaxScalarLength { get; set; }           // 0: unlimited
     public int MaxAliasExpansionEvents { get; set; } = 1_000_000;
     public int MaxDocuments { get; set; } = 16;        // multi document APIs
+    public int Width { get; set; } = 80;               // emitter folding width
+    public int MaxSimpleKeyLength { get; set; } = 128; // longer keys become explicit '? key' entries
+    public string NewLine { get; set; } = Environment.NewLine;
+    public bool IndentedSequences { get; set; }        // indent '- ' entries under their key
+    public YamlStringStyle StringStyle { get; set; }   // Auto (default), Literal, DoubleQuoted
 }
 ```
 
@@ -329,7 +334,7 @@ work.
 ```sh
 dotnet build SVCSystems.Text.Json.Yaml.slnx
 dotnet run --project tests/SVCSystems.Text.Json.Yaml.Tests -c Debug
-dotnet test  # when the .NET SDK test experience is available for MTP projects
+dotnet test  # uses the Microsoft.Testing.Platform runner (configured in global.json)
 dotnet pack src/SVCSystems.Text.Json.Yaml -c Release
 ```
 
@@ -339,6 +344,13 @@ Native AOT validation:
 dotnet publish tests/SVCSystems.Text.Json.Yaml.AotTests -c Release -r linux-x64
 ./artifacts/aot-tests/SVCSystems.Text.Json.Yaml.AotTests
 ```
+
+## Contributing
+
+This repository uses **[Conventional Commits](https://www.conventionalcommits.org/)**:
+[semantic-release](https://semantic-release.gitbook.io/semantic-release/) derives the package
+version and changelog from commit messages, and pull request titles are linted against the
+convention. Use `feat:`, `fix:`, `docs:`, `chore:` and similar prefixes.
 
 ## License
 

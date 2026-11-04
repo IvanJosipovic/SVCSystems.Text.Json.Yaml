@@ -154,7 +154,8 @@ internal static class JsonToYamlConverter
 
     /// <summary>
     /// Writes a mapping key. Simple keys must be single line, so multi line keys are always double
-    /// quoted instead of using a block style.
+    /// quoted instead of using a block style, and the <see cref="YamlStringStyle.Literal"/>
+    /// preference does not apply to keys.
     /// </summary>
     private static void WriteKeyScalar(IEmitter emitter, string value, EmitterContext context)
     {
@@ -162,9 +163,13 @@ internal static class JsonToYamlConverter
         {
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.DoubleQuoted, false, true));
         }
+        else if (JsonScalarResolver.NeedsQuoting(value, context.Schema))
+        {
+            emitter.Emit(new Scalar(default, default, value, ScalarStyle.SingleQuoted, false, true));
+        }
         else
         {
-            WriteScalar(emitter, value, context);
+            emitter.Emit(new Scalar(value));
         }
     }
 
