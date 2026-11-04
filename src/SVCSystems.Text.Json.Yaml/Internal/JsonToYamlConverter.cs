@@ -19,6 +19,8 @@ namespace SVCSystems.Text.Json.Yaml.Internal;
 /// </remarks>
 internal static class JsonToYamlConverter
 {
+    internal static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
     public static string ConvertToString(ReadOnlySpan<byte> utf8Json, YamlSerializerOptions? options = null)
     {
         var writer = new StringWriter();
@@ -32,6 +34,7 @@ internal static class JsonToYamlConverter
         var useFlowStyle = options?.UseFlowStyle ?? false;
         var mappingStyle = useFlowStyle ? MappingStyle.Flow : MappingStyle.Block;
         var sequenceStyle = useFlowStyle ? SequenceStyle.Flow : SequenceStyle.Block;
+        var schema = options?.ScalarSchema ?? YamlScalarSchema.Core;
 
         var emitter = new Emitter(output, EmitterSettings.Default.WithBestIndent(indentation));
 
@@ -45,13 +48,13 @@ internal static class JsonToYamlConverter
             throw new InvalidOperationException("The JSON payload produced by System.Text.Json is empty.");
         }
 
-        ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle);
+        ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle, schema);
 
         emitter.Emit(new DocumentEnd(true, Mark.Empty, Mark.Empty));
         emitter.Emit(new StreamEnd());
     }
 
-    private static void ConvertNode(ref Utf8JsonReader reader, IEmitter emitter, MappingStyle mappingStyle, SequenceStyle sequenceStyle)
+    private static void ConvertNode(ref Utf8JsonReader reader, IEmitter emitter, MappingStyle mappingStyle, SequenceStyle sequenceStyle, YamlScalarSchema schema)
     {
         switch (reader.TokenType)
         {
@@ -72,10 +75,10 @@ internal static class JsonToYamlConverter
                     }
 
                     var name = reader.GetString()!;
-                    WriteKeyScalar(emitter, name);
+                    WriteKeyScalar(emitter, name, schema);
 
                     reader.Read();
-                    ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle);
+                    ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle, schema);
                 }
 
                 emitter.Emit(new MappingEnd());
@@ -92,14 +95,14 @@ internal static class JsonToYamlConverter
                         break;
                     }
 
-                    ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle);
+                    ConvertNode(ref reader, emitter, mappingStyle, sequenceStyle, schema);
                 }
 
                 emitter.Emit(new SequenceEnd());
                 break;
             }
             case JsonTokenType.String:
-                WriteScalar(emitter, reader.GetString()!);
+                WriteScalar(emitter, reader.GetString()!, schema);
                 break;
             case JsonTokenType.Number:
                 // Numbers keep their exact textual representation and are emitted as plain scalars.
@@ -123,7 +126,7 @@ internal static class JsonToYamlConverter
     /// Writes a mapping key. Simple keys must be single line, so multi-line keys are always double
     /// quoted instead of using a block style.
     /// </summary>
-    private static void WriteKeyScalar(IEmitter emitter, string value)
+    private static void WriteKeyScalar(IEmitter emitter, string value, YamlScalarSchema schema)
     {
         if (value.Contains('\n'))
         {
@@ -131,18 +134,18 @@ internal static class JsonToYamlConverter
         }
         else
         {
-            WriteScalar(emitter, value);
+            WriteScalar(emitter, value, schema);
         }
     }
 
-    private static void WriteScalar(IEmitter emitter, string value)
+    private static void WriteScalar(IEmitter emitter, string value, YamlScalarSchema schema)
     {
         if (value.Contains('\n'))
         {
             // Force a multi-line literal block so embedded newlines round-trip exactly.
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.Literal, true, true));
         }
-        else if (JsonScalarResolver.NeedsQuoting(value))
+        else if (JsonScalarResolver.NeedsQuoting(value, schema))
         {
             // The value could be misread as null, a boolean or a number; quote it to preserve the string.
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.SingleQuoted, false, true));

@@ -31,7 +31,6 @@ public partial class YamlToJsonConverterTests
     [InlineData("value:", "null")]
     [InlineData("value: \"null\"", "\"null\"")]
     [InlineData("value: y", "\"y\"")]
-    [InlineData("value: 0x1A", "\"0x1A\"")]
     [InlineData("value: 2026-01-01", "\"2026-01-01\"")]
     [InlineData("value: !!str 123", "\"123\"")]
     [InlineData("value: !!int 3", "3")]
@@ -138,13 +137,102 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
-    public void RejectsAnchorsAndAliases()
+    public void ExpandsAnchorsAndAliases()
     {
-        Should.Throw<YamlException>(() => ConvertToJson("""
+        var json = ConvertToJson("""
             base: &anchor
               x: 1
             copy: *anchor
-            """)).Message.ShouldContain("anchors and aliases");
+            """);
+
+        json.ShouldContain("\"base\":{\"x\":1}");
+        json.ShouldContain("\"copy\":{\"x\":1}");
+    }
+
+    [Fact]
+    public void ExpandsNestedAnchors()
+    {
+        var json = ConvertToJson("""
+            outer: &outer
+              inner: &inner
+                x: 1
+              alias: *inner
+            replay: *outer
+            """);
+
+        json.ShouldContain("\"outer\":{\"inner\":{\"x\":1},\"alias\":{\"x\":1}}");
+        json.ShouldContain("\"replay\":{\"inner\":{\"x\":1},\"alias\":{\"x\":1}}");
+    }
+
+    [Fact]
+    public void RejectsUndefinedAliases()
+    {
+        Should.Throw<YamlException>(() => ConvertToJson("copy: *missing"))
+            .Message.ShouldContain("missing");
+    }
+
+    [Fact]
+    public void BoundsAliasExpansion()
+    {
+        var yaml = """
+            a: &a [0, 1]
+            b: &b [*a, *a]
+            c: &c [*b, *b]
+            d: &d [*c, *c]
+            e: &e [*d, *d]
+            f: &f [*e, *e]
+            g: &g [*f, *f]
+            h: &h [*g, *g]
+            i: &i [*h, *h]
+            j: &j [*i, *i]
+            k: &k [*j, *j]
+            l: &l [*k, *k]
+            m: &m [*l, *l]
+            n: &n [*m, *m]
+            o: &o [*n, *n]
+            p: &p [*o, *o]
+            q: &q [*p, *p]
+            r: &r [*q, *q]
+            s: &s [*r, *r]
+            t: &t [*s, *s]
+            u: &u [*t, *t]
+            v: &v [*u, *u]
+            w: &w [*v, *v]
+            x: &x [*w, *w]
+            y: &y [*x, *x]
+            z: [*y, *y]
+            """;
+
+        var yamlOptions = new YamlSerializerOptions { MaxAliasExpansionEvents = 1000 };
+
+        Should.Throw<YamlException>(() => ConvertToJson(yaml, yamlOptions))
+            .Message.ShouldContain("alias expansion limit");
+
+        // A small chained document succeeds with the default budget.
+        var small = """
+            a: &a [0, 1]
+            b: &b [*a, *a]
+            c: &c [*b, *b]
+            d: [*c, *c]
+            """;
+        var json = ConvertToJson(small, new YamlSerializerOptions());
+        json.ShouldStartWith("{\"a\":[0,1]");
+    }
+
+    [Fact]
+    public void RejectsNestingBeyondMaxDepth()
+    {
+        const int depth = 65;
+        var yaml = string.Concat(Enumerable.Repeat("- ", depth)) + "1";
+
+        Should.Throw<YamlException>(() => YamlSerializer.Deserialize(yaml, TestJsonContext.Default.JsonElement))
+            .Message.ShouldContain("maximum nesting depth");
+
+        // A custom depth below the failing level produces the error at the YAML layer.
+        var yamlOptions = new YamlSerializerOptions { MaxDepth = 2 };
+
+        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("- - - 1", TestJsonContext.Default.JsonElement, yamlOptions))
+            .Message.ShouldContain("maximum nesting depth of 2");
     }
 
     [Fact]
@@ -173,6 +261,103 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void CoreSchemaResolvesHexOctalAndLooseFloatForms()
+    {
+        // Core is the default schema.
+        ConvertToJson("value: 0x1A").ShouldBe("{\"value\":26}");
+        ConvertToJson("value: -0x1A").ShouldBe("{\"value\":-26}");
+        ConvertToJson("value: 0o17").ShouldBe("{\"value\":15}");
+
+        // The JSON restricted schema keeps hexadecimal and octal forms as strings.
+        var jsonSchema = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+
+        ConvertToJson("value: 0x1A", jsonSchema).ShouldBe("{\"value\":\"0x1A\"}");
+        ConvertToJson("value: 0o17", jsonSchema).ShouldBe("{\"value\":\"0o17\"}");
+    }
+
+    [Fact]
+    public void LooseFloatFormsResolveUnderBothSchemas()
+    {
+        ConvertToJson("value: .5").ShouldBe("{\"value\":0.5}");
+        ConvertToJson("value: 5.").ShouldBe("{\"value\":5}");
+        ConvertToJson("value: -.5").ShouldBe("{\"value\":-0.5}");
+
+        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
+
+        ConvertToJson("value: .5", yamlOptions).ShouldBe("{\"value\":0.5}");
+        ConvertToJson("value: 5.", yamlOptions).ShouldBe("{\"value\":5}");
+        ConvertToJson("value: -.5", yamlOptions).ShouldBe("{\"value\":-0.5}");
+    }
+
+    [Fact]
+    public void CoreSchemaResolvesVeryLargeHexIntegersExactly()
+    {
+        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
+
+        ConvertToJson("value: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", yamlOptions)
+            .ShouldBe("{\"value\":340282366920938463463374607431768211455}");
+    }
+
+    [Fact]
+    public void SpecialFloatsCanBeResolvedToStrings()
+    {
+        var yamlOptions = new YamlSerializerOptions { SpecialFloats = SpecialFloatBehavior.String };
+
+        ConvertToJson("value: .inf", yamlOptions).ShouldBe("{\"value\":\".inf\"}");
+        ConvertToJson("value: -.inf", yamlOptions).ShouldBe("{\"value\":\"-.inf\"}");
+        ConvertToJson("value: .nan", yamlOptions).ShouldBe("{\"value\":\".nan\"}");
+
+        // Rejection remains the default.
+        Should.Throw<YamlException>(() => ConvertToJson("value: .inf"));
+    }
+
+    [Fact]
+    public void UnknownTagsCanBeIgnored()
+    {
+        var yamlOptions = new YamlSerializerOptions { UnknownTags = UnknownTagBehavior.Ignore };
+
+        // A custom tag asserts an application specific type with no JSON mapping; the scalar is
+        // resolved conservatively to its exact text as a string.
+        ConvertToJson("value: !Custom 123", yamlOptions).ShouldBe("{\"value\":\"123\"}");
+        ConvertToJson("value: !Custom hello", yamlOptions).ShouldBe("{\"value\":\"hello\"}");
+
+        // Rejection remains the default.
+        Should.Throw<YamlException>(() => ConvertToJson("value: !Custom 123"))
+            .Message.ShouldContain("not supported");
+    }
+
+    [Fact]
+    public void BinaryAndTimestampTagsAreOptIn()
+    {
+        Should.Throw<YamlException>(() => ConvertToJson("value: !!binary aGVsbG8=")).Message.ShouldContain("not supported");
+        Should.Throw<YamlException>(() => ConvertToJson("value: !!timestamp 2026-01-01T00:00:00Z")).Message.ShouldContain("not supported");
+
+        var allow = new YamlSerializerOptions { AllowBinaryTag = true, AllowTimestampTag = true };
+
+        ConvertToJson("value: !!binary aGVsbG8=", allow).ShouldBe("{\"value\":\"aGVsbG8=\"}");
+        ConvertToJson("value: !!timestamp 2026-01-01T00:00:00Z", allow).ShouldBe("{\"value\":\"2026-01-01T00:00:00Z\"}");
+    }
+
+    [Fact]
+    public void BoundsScalarLength()
+    {
+        var yamlOptions = new YamlSerializerOptions { MaxScalarLength = 4 };
+
+        ConvertToJson("k: ab", yamlOptions).ShouldBe("{\"k\":\"ab\"}");
+        Should.Throw<YamlException>(() => ConvertToJson("key: longer-value", yamlOptions))
+            .Message.ShouldContain("maximum scalar length");
+    }
+
+    [Fact]
+    public void BoundsInputLength()
+    {
+        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
+
+        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("a: a-longer-value", TestJsonContext.Default.JsonElement, yamlOptions))
+            .Message.ShouldContain("maximum input length");
+    }
+
+    [Fact]
     public void HandlesDeepNestingUpToTheDefaultLimit()
     {
         const int depth = 60;
@@ -188,18 +373,11 @@ public partial class YamlToJsonConverterTests
         current.GetInt32().ShouldBe(1);
     }
 
-    [Fact]
-    public void RejectsNestingBeyondTheDefaultLimit()
-    {
-        const int depth = 65;
-        var yaml = string.Concat(Enumerable.Repeat("- ", depth)) + "1";
-
-        Should.Throw<JsonException>(() => YamlSerializer.Deserialize(yaml, TestJsonContext.Default.JsonElement));
-    }
-
     private static string ConvertToJson(string yaml, YamlSerializerOptions? options = null)
     {
-        var parser = new Parser(new StringReader(yaml));
+        var parser = new SVCSystems.Text.Json.Yaml.Internal.AliasExpandingParser(
+            new Parser(new StringReader(yaml)),
+            options?.MaxAliasExpansionEvents ?? YamlSerializerOptions.DefaultMaxAliasExpansionEvents);
         var buffer = new System.Buffers.ArrayBufferWriter<byte>();
 
         using (var writer = new Utf8JsonWriter(buffer))

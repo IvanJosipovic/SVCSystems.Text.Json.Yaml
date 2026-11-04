@@ -83,8 +83,18 @@ public sealed class YamlSerializerOptions
     public int Indentation { get; set; } = 2;          // 1..9 spaces for nested block collections
     public bool EmitDocumentStart { get; set; }        // emit an explicit '---' marker
     public bool UseFlowStyle { get; set; }             // {a: 1} and [1, 2] instead of block style
-    public YamlScalarSchema ScalarSchema { get; set; } = YamlScalarSchema.Json;
+    public YamlScalarSchema ScalarSchema { get; set; } = YamlScalarSchema.Core; // or Json
     public bool AllowDuplicateKeys { get; set; }       // false: reject, true: last value wins
+    public bool AllowMergeKeys { get; set; } = true;   // apply '<<' merge keys
+    public SpecialFloatBehavior SpecialFloats { get; set; } // Reject (default) or String
+    public UnknownTagBehavior UnknownTags { get; set; }     // Reject (default) or Ignore
+    public bool AllowBinaryTag { get; set; }           // accept '!!binary' as a base64 string
+    public bool AllowTimestampTag { get; set; }        // accept '!!timestamp' as a string
+    public int MaxDepth { get; set; } = 64;            // nesting limit
+    public int MaxInputLength { get; set; }            // 0: unlimited
+    public int MaxScalarLength { get; set; }           // 0: unlimited
+    public int MaxAliasExpansionEvents { get; set; } = 1_000_000;
+    public int MaxDocuments { get; set; } = 16;        // multi document APIs
 }
 ```
 
@@ -185,21 +195,22 @@ proves no reflection fallback is used:
 
 ## YAML scalar handling
 
-The default `YamlScalarSchema.Json` follows the YAML 1.2 core schema, which aligns with JSON:
+The default `YamlScalarSchema.Core` implements the YAML 1.2 core schema (section 10.3 of the
+specification):
 
 | YAML input | Resolves to |
 |---|---|
 | `true`, `True`, `false` | boolean |
 | `null`, `Null`, `NULL`, `~`, empty | null |
 | `42`, `-7`, `+42`, `007` | integer (leading zeros are decimal) |
-| `1.25`, `1.20`, `1e5` | number |
+| `0x1A`, `0o17` | integer (core schema; pass `YamlScalarSchema.Json` to keep them strings) |
+| `1.25`, `1.20`, `1e5`, `.5`, `5.` | number |
 | `"1.20"`, `'true'`, `"null"` | string (quoted scalars are always strings) |
-| `yes`, `no`, `on`, `off`, `y` | string (YAML 1.1 booleans are not JSON booleans) |
+| `yes`, `no`, `on`, `off`, `y` | string (YAML 1.1 booleans are not core-schema booleans) |
 | `2026-01-01` | string (timestamps have no JSON equivalent) |
-| `0x1A`, `0o17` | string (hexadecimal/octal are not JSON integers) |
-| `.inf`, `-.inf`, `.nan` | rejected (no JSON number representation) |
+| `.inf`, `-.inf`, `.nan` | rejected by default (no JSON number representation); set `SpecialFloats = String` to keep the text as a string |
 
-All numeric parsing is culture invariant.
+All numeric parsing is culture invariant. Integers that exceed 64 bits keep their exact value.
 
 ### Scalar preservation
 
@@ -217,24 +228,60 @@ var yaml = YamlSerializer.Serialize(JsonSerializer.Deserialize<JsonElement>(json
 ## Supported YAML subset
 
 Supported: block and flow mappings and sequences, plain/quoted/block scalars, comments (ignored),
-the standard YAML tags (`!!str`, `!!int`, `!!float`, `!!bool`, `!!null`), explicit document start
-(`---`), and nesting to the System.Text.Json default depth (64).
+explicit keys (`? key : value`), anchors and aliases (expanded, with an expansion budget against
+"billion laughs"), merge keys (`<<`, spec precedence), explicit document start (`---`), multiple
+documents (via the dedicated APIs), the standard YAML tags (`!!str`, `!!int`, `!!float`, `!!bool`,
+`!!null`, and optionally `!!binary`/`!!timestamp`), and configurable nesting depth.
 
-Explicitly rejected with a descriptive error (including line/column where possible):
+The default `YamlScalarSchema.Core` follows the YAML 1.2 core schema; see
+[docs/yaml-1.2-compat-plan.md](docs/yaml-1.2-compat-plan.md) for the measured conformance against
+the official yaml-test-suite.
 
-- Anchors and aliases (`&anchor`, `*anchor`) and merge keys (`<<`)
+Explicitly rejected with a descriptive error (including line/column where possible), unless the
+corresponding policy is enabled:
+
 - Complex mapping keys (sequences/mappings used as keys)
-- Custom and non-standard tags (for example `!MyType`, `!!timestamp`, `!!binary`)
-- Multiple documents in a single call
-- Duplicate mapping keys (unless `AllowDuplicateKeys` is enabled; then the last value wins)
+- Custom and non-standard tags (for example `!MyType`), unless `UnknownTags = Ignore`
+- `!!binary`/`!!timestamp`, unless `AllowBinaryTag`/`AllowTimestampTag` is enabled
+- Special floats `.inf`/`.nan`, unless `SpecialFloats = String`
+- Multiple documents in a single `Deserialize` call (use `DeserializeFirstDocument` or
+  `DeserializeDocuments`)
+- Duplicate mapping keys, unless `AllowDuplicateKeys` is enabled (then the last value wins)
+- Merge keys, unless `AllowMergeKeys` (enabled by default)
+- Limits: `MaxDepth` (64), optional `MaxInputLength`/`MaxScalarLength`, alias expansion budget
+
+## Multi document streams
+
+```csharp
+// One .NET value per document.
+List<Person?> people = YamlSerializer.DeserializeDocuments(yamlText, AppJsonContext.Default.Person);
+
+// Only the first document.
+Person? first = YamlSerializer.DeserializeFirstDocument(yamlText, AppJsonContext.Default.Person);
+
+// Every document is emitted with an explicit '---' marker.
+string stream = YamlSerializer.SerializeDocuments([a, b, c], AppJsonContext.Default.Person);
+```
+
+## Streams
+
+```csharp
+using var file = File.OpenRead("config.yaml");
+var config = YamlSerializer.Deserialize(file, ConfigJsonContext.Default.Config);
+
+using var output = File.Create("out.yaml");
+YamlSerializer.Serialize(output, config, ConfigJsonContext.Default.Config);
+```
 
 ## Known limitations
 
-- The JSON compatible subset of YAML is supported; arbitrary YAML documents may be rejected.
-  The path to full [YAML 1.2.2](https://yaml.org/spec/1.2.2/) compatibility is planned in
-  [docs/yaml-1.2-compat-plan.md](docs/yaml-1.2-compat-plan.md) (multi-document streams,
-  anchors/aliases, merge keys, tag policies, scalar schemas, comments).
-- YAML formatting is not preserved on round trips (comments, quoting styles, anchor/alias graphs).
+- Comments and YAML formatting (quoting styles, indentation, anchors) are not preserved on round
+  trips: the JSON data model that bridges YAML to .NET objects has no slot for them, and the
+  specification assigns comments no data meaning. Structural fidelity is covered by the
+  conformance suite; a comment-preserving rewrite API would be a separate, non-JSON tool.
+- A small number of yaml-test-suite cases deviate from the upstream YamlDotNet scanner (tab
+  handling, some block scalar chomping edge cases); each is named and skipped with a reason in
+  the conformance suite.
 - Intermediate JSON is buffered; the reflection based overloads need runtime reflection.
 - YamlDotNet's emitter escapes some non-ASCII scalars (for example emoji) using double quoted
   escapes; the values still round trip exactly.

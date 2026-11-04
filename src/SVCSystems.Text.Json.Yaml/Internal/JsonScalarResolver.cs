@@ -13,13 +13,13 @@ namespace SVCSystems.Text.Json.Yaml.Internal;
 /// </summary>
 /// <remarks>
 /// YAML 1.1 and YAML 1.2 disagree on several scalar classes (for example <c>yes</c>, <c>on</c> and
-/// <c>~</c>). This resolver implements the <see cref="YamlScalarSchema.Json"/> schema, which follows
-/// the YAML 1.2 core schema and aligns with JSON semantics:
+/// <c>~</c>). This resolver implements the YAML 1.2 core schema (the default
+/// <see cref="YamlScalarSchema.Core"/>):
 /// <list type="bullet">
 ///   <item><description>Booleans are <c>true</c>/<c>false</c> in any capitalization; <c>yes</c>, <c>no</c>, <c>on</c> and <c>off</c> are strings.</description></item>
 ///   <item><description>Null is an empty scalar, <c>null</c> (any capitalization) or <c>~</c>.</description></item>
-///   <item><description>Integers are optionally signed decimal digits. Leading zeros are interpreted as decimal (YAML 1.1 octal such as <c>00123</c> is parsed as the decimal number <c>123</c>). Hexadecimal (<c>0x1A</c>), octal (<c>0o17</c>) and sexagesimal notation are strings.</description></item>
-///   <item><description>Floats are decimal numbers with optional exponent; <c>.nan</c> and <c>.inf</c> are not representable in JSON and are rejected.</description></item>
+///   <item><description>Integers are optionally signed decimal digits; under the Core schema hexadecimal (<c>0x1A</c>) and octal (<c>0o17</c>) forms also resolve to integers. Leading zeros are interpreted as decimal (YAML 1.1 octal such as <c>00123</c> is parsed as the decimal number <c>123</c>); sexagesimal notation is a string.</description></item>
+///   <item><description>Floats are decimal numbers with optional exponent; <c>.nan</c> and <c>.inf</c> have no JSON representation and follow <see cref="SpecialFloatBehavior"/>.</description></item>
 ///   <item><description>Timestamps such as <c>2026-01-01</c> have no JSON equivalent and remain strings.</description></item>
 ///   <item><description>Quoted scalars are always strings.</description></item>
 /// </list>
@@ -144,15 +144,16 @@ internal static class JsonScalarResolver
 
     /// <summary>
     /// Determines whether a JSON string written as a plain YAML scalar could be misinterpreted
-    /// as a non-string value when parsed again.
+    /// as a non-string value when parsed again with the given schema.
     /// </summary>
-    public static bool NeedsQuoting(string? value)
+    public static bool NeedsQuoting(string? value, YamlScalarSchema schema = YamlScalarSchema.Core)
     {
         return string.IsNullOrEmpty(value)
             || IsNullScalar(value)
             || TryResolveBoolean(value, out _)
             || IsIntegerScalar(value)
-            || IsFloatScalar(value);
+            || IsFloatScalar(value)
+            || (schema == YamlScalarSchema.Core && (IsHexIntegerScalar(value) || IsOctalIntegerScalar(value)));
     }
 
     /// <summary>
@@ -160,18 +161,122 @@ internal static class JsonScalarResolver
     /// </summary>
     public static void RejectSpecialFloats(Scalar scalar)
     {
-        if (scalar.Style == ScalarStyle.Plain)
+        if (scalar.Style == ScalarStyle.Plain && IsSpecialFloat(scalar.Value))
         {
-            switch (scalar.Value)
+            throw new YamlException(scalar.Start, scalar.End,
+                $"The scalar '{scalar.Value}' is not supported because it has no JSON number representation. Quote the value ('\"{scalar.Value}\"') to treat it as a string.");
+        }
+    }
+
+    /// <summary>
+    /// Determines whether the plain scalar is a YAML special float (<c>.inf</c>, <c>.nan</c> and
+    /// their signed and capitalized forms), which has no JSON number representation.
+    /// </summary>
+    public static bool IsSpecialFloat(string? value)
+    {
+        return value is ".nan" or ".NaN" or ".NAN" or
+            ".inf" or ".Inf" or ".INF" or
+            "+.inf" or "+.Inf" or "+.INF" or
+            "-.inf" or "-.Inf" or "-.INF";
+    }
+
+    /// <summary>
+    /// Determines whether the plain scalar is a hexadecimal integer per the YAML 1.2 core schema
+    /// (<c>0x1A</c>, <c>-0x1A</c>).
+    /// </summary>
+    public static bool IsHexIntegerScalar(string? value)
+    {
+        return IsRadixIntegerScalar(value, "0x", "0X", IsHexDigit);
+    }
+
+    /// <summary>
+    /// Determines whether the plain scalar is an octal integer per the YAML 1.2 core schema
+    /// (<c>0o17</c>, <c>-0o17</c>).
+    /// </summary>
+    public static bool IsOctalIntegerScalar(string? value)
+    {
+        return IsRadixIntegerScalar(value, "0o", "0O", c => c is >= '0' and <= '7');
+    }
+
+    private static bool IsRadixIntegerScalar(string? value, string lowerPrefix, string upperPrefix, Func<char, bool> isDigit)
+    {
+        if (value is not { Length: > 2 })
+        {
+            return false;
+        }
+
+        var start = value[0] is '-' or '+' ? 1 : 0;
+
+        if (!value.AsSpan(start).StartsWith(lowerPrefix) && !value.AsSpan(start).StartsWith(upperPrefix))
+        {
+            return false;
+        }
+
+        var digits = value.AsSpan(start + 2);
+
+        if (digits.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var c in digits)
+        {
+            if (!isDigit(c))
             {
-                case ".nan" or ".NaN" or ".NAN" or
-                     ".inf" or ".Inf" or ".INF" or
-                     "+.inf" or "+.Inf" or "+.INF" or
-                     "-.inf" or "-.Inf" or "-.INF":
-                    throw new YamlException(scalar.Start, scalar.End,
-                        $"The scalar '{scalar.Value}' is not supported because it has no JSON number representation. Quote the value ('\"{scalar.Value}\"') to treat it as a string.");
+                return false;
             }
         }
+
+        return true;
+    }
+
+    private static bool IsHexDigit(char c) => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
+
+    /// <summary>
+    /// Determines whether the plain scalar resolves to a floating point number under the YAML 1.2
+    /// core schema, which additionally allows forms such as <c>.5</c> and <c>1.</c>.
+    /// </summary>
+    public static bool IsCoreFloatScalar(string? value)
+    {
+        return IsFloatScalar(value) || IsMantissaOnlyFloatScalar(value);
+    }
+
+    /// <summary>
+    /// Matches the core schema float forms that consist of a mantissa with a dot but no exponent:
+    /// <c>.5</c>, <c>-.5</c>, <c>+5.</c> and so on. <see cref="double"/> and <see cref="decimal"/>
+    /// parse these forms natively.
+    /// </summary>
+    private static bool IsMantissaOnlyFloatScalar(string? value)
+    {
+        if (value is not { Length: > 1 })
+        {
+            return false;
+        }
+
+        var start = value[0] is '-' or '+' ? 1 : 0;
+        var digits = value.AsSpan(start);
+
+        // The mantissa must contain at least one digit and exactly one dot: ".5" or "5.".
+        var dotCount = 0;
+        var digitCount = 0;
+
+        foreach (var c in digits)
+        {
+            if (c is >= '0' and <= '9')
+            {
+                digitCount++;
+            }
+            else if (c == '.')
+            {
+                dotCount++;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        return digitCount > 0 && dotCount == 1;
     }
 
     /// <summary>

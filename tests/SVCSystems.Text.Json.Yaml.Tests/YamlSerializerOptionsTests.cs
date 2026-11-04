@@ -196,9 +196,9 @@ public partial class YamlSerializerOptionsTests
     }
 
     [Fact]
-    public void JsonScalarSchemaIsTheDefault()
+    public void CoreScalarSchemaIsTheDefault()
     {
-        new YamlSerializerOptions().ScalarSchema.ShouldBe(YamlScalarSchema.Json);
+        new YamlSerializerOptions().ScalarSchema.ShouldBe(YamlScalarSchema.Core);
         new YamlSerializerOptions().Indentation.ShouldBe(2);
         new YamlSerializerOptions().EmitDocumentStart.ShouldBeFalse();
         new YamlSerializerOptions().UseFlowStyle.ShouldBeFalse();

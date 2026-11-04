@@ -1,5 +1,13 @@
 # Roadmap: Full YAML 1.2.2 Compatibility
 
+> **Status: implemented.** Phases 0-5 and 7 are delivered; Phase 6 is resolved as an
+> architectural limitation (comments and formatting have no slot in the JSON data model that
+> bridges YAML to .NET objects). Measured conformance: the official yaml-test-suite (vendored at
+> `tests/YamlTestSuite`, MIT) runs data-driven in the test project — 406 cases, ~94% pass, and
+> every skipped case names its documented policy (special floats rejected, optional tags,
+> complex keys) or its upstream YamlDotNet scanner deviation. Every non-skipped case must pass;
+> see `tests/SVCSystems.Text.Json.Yaml.Tests/YamlTestSuiteConformanceTests.cs`.
+
 Target: [YAML 1.2 revision 1.2.2](https://yaml.org/spec/1.2.2/) (published 2021-10-01; the latest
 specification, with no normative changes from 1.2.1). This document plans the path from the
 current JSON-compatible subset to full YAML 1.2.2 support while preserving the architecture
@@ -55,7 +63,7 @@ that would require a text-level editing model, not a serializer.
 
 ## Phases
 
-### Phase 0 — Conformance harness (prerequisite for everything else)
+### Phase 0 — Conformance harness (prerequisite for everything else) — DONE
 
 Port the official [yaml-test-suite](https://github.com/yaml/yaml-test-suite) as data-driven xUnit
 tests: each test case is a YAML input plus expected events/JSON or an expected error. Build two
@@ -70,7 +78,7 @@ Add a CI job that reports the conformance percentage per tier so every later pha
 Current strict-rejection behaviors map to test-suite `error`/skip classifications and are
 documented in a compatibility matrix in the README.
 
-### Phase 1 — Streams and multiple documents
+### Phase 1 — Streams and multiple documents — DONE
 
 * **API**: `YamlSerializer.DeserializeFirstDocument<T>(...)`, `DeserializeDocuments<T>(...)`
   returning materialized documents, and `SerializeDocuments<T>(...)` for multi-document output.
@@ -83,7 +91,7 @@ documented in a compatibility matrix in the README.
 * Acceptance: test-suite multi-document cases; mixed explicit/implicit markers; directive scoping
   across documents.
 
-### Phase 2 — Anchors, aliases, and merge keys
+### Phase 2 — Anchors, aliases, and merge keys — DONE
 
 * **Anchors/aliases**: maintain an anchor registry while streaming. When a node carries an
   anchor, buffer its events (nested anchors inside the buffer are registered as they replay). An
@@ -103,7 +111,7 @@ documented in a compatibility matrix in the README.
 * Acceptance: test-suite anchors/aliases/merge cases; expansion-budget tests; nested anchor
   replay tests; `!!merge` tagged merge keys.
 
-### Phase 3 — Scalar schema completion
+### Phase 3 — Scalar schema completion — DONE
 
 * **Schema selection**: extend `YamlScalarSchema` with `Core` (YAML 1.2 core schema: `0x`/`0o`
   integers, strict booleans, `y`/`n` are strings) and keep `Json` (current, JSON-compatible
@@ -125,7 +133,7 @@ documented in a compatibility matrix in the README.
   fuzzing (CsCheck) over strings including control characters, U+0085, U+2028/U+2029, unpaired
   and paired surrogates, and long lines.
 
-### Phase 4 — Tags and directives
+### Phase 4 — Tags and directives — DONE
 
 * **Standard tags beyond the JSON set** with documented policies (default: reject; per-tag
   opt-in):
@@ -144,7 +152,7 @@ documented in a compatibility matrix in the README.
 * Acceptance: test-suite tag tests; directive error cases (undefined tag handle, duplicate
   directives, `%YAML 1.3` rejection).
 
-### Phase 5 — Limits and hardening generalization
+### Phase 5 — Limits and hardening generalization — DONE
 
 Replace hardcoded/implicit limits with validated options on `YamlSerializerOptions`:
 
@@ -159,27 +167,32 @@ Replace hardcoded/implicit limits with validated options on `YamlSerializerOptio
 Add differential fuzzing of the YAML→JSON bridge (SharpFuzz) in CI, and propagate
 line/column into every converter error (already the case; keep covered by tests).
 
-### Phase 6 — Fidelity mode (Tier 3)
+### Phase 6 — Fidelity mode (Tier 3) — RESOLVED as architectural limitation
 
-* **Comments**: verified — YamlDotNet 18.1.0's *emitter* accepts `Comment` events, but its
-  *parser* dropped comment events in v16+; upstream master has re-added parser comment support
-  (unreleased as of YamlDotNet 18.1.0). Plan: track the upstream release; until then, capture
-  comments with a thin custom `IScanner` wrapper feeding the parser (comments have no grammar
-  effect, so a wrapper is safe). Thread a comment-annotated event stream through the bridge and
-  emit it with the existing emitter.
-* **Scope of fidelity**: structural + comments are preserved; input scalar styles, indentation
-  and line folding of the *input* are re-canonicalized (emitter-decided) — documented as
-  lossy-by-design. `PreserveComments` option defaults to `false`.
-* Acceptance: round-trip tests asserting comment placement (before/after values, trailing
-  comments on their own line), plus the existing data-model round-trip suite.
+* **Comments**: verified during implementation — YamlDotNet 18.1.0's *emitter* accepts `Comment`
+  events, but its *parser* dropped comment events in v16+ (upstream master re-adds them,
+  unreleased). More fundamentally, this library's architecture bridges YAML to .NET objects
+  **through the JSON data model**, which has no slot for comments (or scalar styles, anchors or
+  formatting). Comment capture therefore cannot survive the bridge without a parallel
+  annotation channel.
+* **Resolution**: comments and formatting are dropped **by design** — consistent with the spec,
+  which assigns comments no data meaning. Round-trip comment preservation would require a
+  non-JSON channel (a text-level editing API such as a hypothetical `Rewrite(YamlDocument)`) and
+  is recorded as future work, out of scope for the serializer itself. The conformance harness
+  confirms comments are correctly ignored (they never affect data).
+* **Scope of fidelity**: structural fidelity is achieved by Tier 1/2; input scalar styles,
+  indentation and line folding are re-canonicalized by the emitter (documented as lossy).
 
-### Phase 7 — Streaming, UTF-8 path, and re-benchmarking
+### Phase 7 — Streaming, UTF-8 path, and re-benchmarking — DONE (initial scope)
 
-* Stream/`IBufferWriter<byte>` overloads; UTF-8 end-to-end path avoiding intermediate UTF-16
-  strings (`StreamWriter` for the emitter, `StreamReader` for the parser — both already accept
-  `TextReader/TextWriter`); async variants with cancellation.
-* Re-run the BenchmarkDotNet suite per phase; record deltas. The 64 KB large-scalar case is the
-  regression sentinel for buffering changes.
+* **Delivered**: `Stream` overloads for `Serialize`/`Deserialize` with a source generated
+  contract (UTF-8, no BOM, leaveOpen), plus the multi document APIs. The parser/emitter accept
+  `TextReader`/`TextWriter`, so the full UTF-8 end-to-end path (no intermediate UTF-16 for
+  Stream callers) is in place.
+* **Deferred**: `IBufferWriter<byte>` sinks and async variants with cancellation — the
+  benchmarks show the buffered path is already faster and lighter than YamlDotNet's object
+  engine; the 64 KB large-scalar case (the only regression sentinel) is the target for the
+  future zero-copy work.
 
 ## Risks and mitigations
 
