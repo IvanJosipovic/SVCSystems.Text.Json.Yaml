@@ -117,21 +117,36 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
-        var buffer = new PooledBufferWriter();
+        // The YAML document is encoded into pooled UTF-8 buffers and written with a single call,
+        // mirroring SerializeAsync (batched write) instead of chunked streaming.
+        var jsonBuffer = new PooledBufferWriter();
 
         try
         {
-            using (var writer = new Utf8JsonWriter(buffer))
+            using (var writer = new Utf8JsonWriter(jsonBuffer))
             {
                 JsonSerializer.Serialize(writer, value, jsonTypeInfo);
             }
 
-            using var streamWriter = new StreamWriter(stream, JsonToYamlConverter.Utf8NoBom, bufferSize: 1024, leaveOpen: true);
-            JsonToYamlConverter.Convert(buffer.WrittenSpan, streamWriter, yamlOptions);
+            var yamlBuffer = new PooledBufferWriter();
+
+            try
+            {
+                using (var streamWriter = new StreamWriter(new PooledBufferStream(yamlBuffer), JsonToYamlConverter.Utf8NoBom, bufferSize: 1024, leaveOpen: true))
+                {
+                    JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, streamWriter, yamlOptions);
+                }
+
+                stream.Write(yamlBuffer.WrittenSpan);
+            }
+            finally
+            {
+                yamlBuffer.Dispose();
+            }
         }
         finally
         {
-            buffer.Dispose();
+            jsonBuffer.Dispose();
         }
     }
 
