@@ -1,0 +1,10 @@
+<Solution>
+  <Project Path="src/SVCSystems.Text.Json.Yaml/SVCSystems.Text.Json.Yaml.csproj" />
+  <Project Path="tests/ExternalContracts/ExternalContracts.csproj" />
+  <Project Path="tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj" />
+  <Project Path="tests/SVCSystems.Text.Json.Yaml.AotTests/SVCSystems.Text.Json.Yaml.AotTests.csproj" />
+  <Folder Name="/benchmarks/" />
+  <Folder Name="/src/" />
+  <Folder Name="/tests/" />
+  <Project Path="benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks.csproj" />
+</Solution>

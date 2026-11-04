@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Cancellation tests deliberately pass pre-cancelled tokens. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
+    <!-- Tests intentionally exercise the reflection based overloads outside of AOT. -->
+    <NoWarn Condition="'$(Configuration)' == 'Aot'">$(NoWarn);IL2026;IL3050</NoWarn>
+    <!-- Publish the test suite as a Native AOT application with `dotnet publish -c Aot`. -->
+    <PublishAot Condition="'$(Configuration)' == 'Aot'">true</PublishAot>
+    <TrimMode Condition="'$(Configuration)' == 'Aot'">full</TrimMode>
+    <JsonSerializerIsReflectionEnabledByDefault Condition="'$(Configuration)' == 'Aot'">false</JsonSerializerIsReflectionEnabledByDefault>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3.aot.mtp-v2" Version="4.0.2" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.12.0" Condition="'$(Configuration)' != 'Aot'" />
+    <PackageReference Include="Microsoft.Testing.Extensions.HangDump" Version="2.5.2" Condition="'$(Configuration)' != 'Aot'" />
+    <PackageReference Include="Shouldly" Version="5.0.0-preview.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SVCSystems.Text.Json.Yaml\SVCSystems.Text.Json.Yaml.csproj" />
+    <ProjectReference Include="..\ExternalContracts\ExternalContracts.csproj" />
+  </ItemGroup>
+
+</Project>

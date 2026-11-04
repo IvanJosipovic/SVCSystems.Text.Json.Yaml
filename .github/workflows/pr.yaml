@@ -1,0 +1,30 @@
+name: PR Build & Test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  build-test:
+    name: Build & Test
+    permissions:
+      contents: read
+    uses: IvanJosipovic/templates/.github/workflows/csharp-build-test.yaml@main
+
+  aot-tests:
+    name: Native AOT xUnit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v6
+      with:
+        global-json-file: global.json
+
+    # Restore in the AOT configuration to include the compiler pack; the xUnit AOT package also keeps its apphost pack enabled.
+    - run: dotnet restore tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj -p:Configuration=Aot -r linux-x64
+    - run: dotnet publish tests/SVCSystems.Text.Json.Yaml.Tests/SVCSystems.Text.Json.Yaml.Tests.csproj -c Aot -f net11.0 -r linux-x64 --self-contained true --no-restore -o artifacts/aot-tests
+    - run: ./artifacts/aot-tests/SVCSystems.Text.Json.Yaml.Tests

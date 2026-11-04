@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
+    <PackageId>SVCSystems.Text.Json.Yaml</PackageId>
+    <RootNamespace>SVCSystems.Text.Json.Yaml</RootNamespace>
+    <Version>1.0.0</Version>
+    <Description>YAML serialization and deserialization for .NET using System.Text.Json serialization infrastructure.</Description>
+    <PackageTags>yaml;json;system.text.json;serializer;yamldotnet;aot;source-generator</PackageTags>
+    <Authors>SVCSystems</Authors>
+    <RepositoryUrl>https://github.com/IvanJosipovic/SVCSystems.Text.Json.Yaml</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <IsPackable>true</IsPackable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IsTrimmable>true</IsTrimmable>
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <SuppressTrimAnalysisWarnings>false</SuppressTrimAnalysisWarnings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="11.0.100-rc.3.26522.148" PrivateAssets="all" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SVCSystems.Text.Json.Yaml.Tests" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
