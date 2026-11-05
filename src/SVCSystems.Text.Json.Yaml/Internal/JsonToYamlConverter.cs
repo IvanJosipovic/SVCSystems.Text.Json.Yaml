@@ -20,7 +20,7 @@ namespace SVCSystems.Text.Json.Yaml.Internal;
 /// </remarks>
 internal static class JsonToYamlConverter
 {
-    internal static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+    internal static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     /// <summary>Emitter configuration captured once per conversion.</summary>
     private sealed class EmitterContext
@@ -47,10 +47,7 @@ internal static class JsonToYamlConverter
 
         try
         {
-            using var stream = new PooledBufferStream(buffer);
-            using var writer = new StreamWriter(stream, Utf8NoBom, bufferSize: 1024, leaveOpen: true);
-            Convert(utf8Json, writer, options);
-            writer.Flush();
+            Convert(utf8Json, buffer, options);
 
             return Encoding.UTF8.GetString(buffer.WrittenSpan);
         }
@@ -58,6 +55,30 @@ internal static class JsonToYamlConverter
         {
             buffer.Dispose();
         }
+    }
+
+    public static byte[] ConvertToUtf8Bytes(ReadOnlySpan<byte> utf8Json, YamlSerializerOptions? options = null)
+    {
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            Convert(utf8Json, buffer, options);
+
+            return buffer.WrittenSpan.ToArray();
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
+    }
+
+    public static void Convert(ReadOnlySpan<byte> utf8Json, IBufferWriter<byte> output, YamlSerializerOptions? options = null)
+    {
+        // The emitter's characters are UTF-8 encoded straight into the caller's buffers; the
+        // writer's dispose performs the final flush (pending surrogate handling).
+        using var textWriter = new Utf8BufferTextWriter(output);
+        Convert(utf8Json, textWriter, options);
     }
 
     public static void Convert(ReadOnlySpan<byte> utf8Json, TextWriter output, YamlSerializerOptions? options = null)
@@ -83,7 +104,7 @@ internal static class JsonToYamlConverter
 
     internal static EmitterSettings CreateEmitterSettings(YamlSerializerOptions? options)
     {
-        var settings = EmitterSettings.Default.WithBestIndent(options?.Indentation ?? YamlSerializerOptions.DefaultIndentation);
+        var settings = EmitterSettings.Default.WithBestIndent(options?.IndentSize ?? YamlSerializerOptions.DefaultIndentSize);
 
         if (options is null)
         {
@@ -105,6 +126,7 @@ internal static class JsonToYamlConverter
             case JsonTokenType.StartObject:
             {
                 emitter.Emit(new MappingStart(default, default, true, context.MappingStyle));
+                var propertyNames = new HashSet<string>(StringComparer.Ordinal);
 
                 while (reader.Read())
                 {
@@ -119,6 +141,11 @@ internal static class JsonToYamlConverter
                     }
 
                     var name = reader.GetString()!;
+                    if (!propertyNames.Add(name))
+                    {
+                        throw new JsonException($"The JSON object contains the duplicate property name '{name}', which cannot be serialized as a YAML mapping.");
+                    }
+
                     WriteKeyScalar(emitter, name, context);
 
                     reader.Read();
@@ -173,7 +200,7 @@ internal static class JsonToYamlConverter
     /// </summary>
     private static void WriteKeyScalar(IEmitter emitter, string value, EmitterContext context)
     {
-        if (value.Contains('\n') || context.StringStyle == YamlStringStyle.DoubleQuoted)
+        if (value.Contains('\n') || value.Contains('\r') || context.StringStyle == YamlStringStyle.DoubleQuoted)
         {
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.DoubleQuoted, false, true));
         }
@@ -189,7 +216,12 @@ internal static class JsonToYamlConverter
 
     private static void WriteScalar(IEmitter emitter, string value, EmitterContext context)
     {
-        if (value.Contains('\n') && context.StringStyle != YamlStringStyle.DoubleQuoted)
+        if (value.Contains('\r'))
+        {
+            // YAML normalizes literal line breaks; escape CR characters to preserve JSON text.
+            emitter.Emit(new Scalar(default, default, value, ScalarStyle.DoubleQuoted, false, true));
+        }
+        else if (value.Contains('\n') && context.StringStyle != YamlStringStyle.DoubleQuoted)
         {
             // Force a multi line literal block so embedded newlines round-trip exactly.
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.Literal, true, true));

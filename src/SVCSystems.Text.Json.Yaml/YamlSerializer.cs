@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Json;
@@ -20,11 +21,11 @@ namespace SVCSystems.Text.Json.Yaml;
 /// internally to parse and emit YAML but is otherwise an implementation detail and does not leak
 /// into the public API.
 /// <para>
-/// The supported YAML surface is the JSON compatible subset plus the structural features of
-/// YAML 1.2 that map losslessly into the JSON data model: multiple documents (via the dedicated
-/// APIs), anchors and aliases, merge keys, explicit keys and the standard YAML tags. See the
-/// project README and <see cref="YamlSerializerOptions"/> for the supported scalar semantics and
-/// configurable policies.
+/// The supported YAML surface is the YAML 1.2.2 JSON-representable profile: Core and JSON scalar
+/// schemas, scalar mapping keys, supported standard tags, multiple documents (via the dedicated
+/// APIs), and acyclic anchors and aliases. Merge keys, custom tags, complex mapping keys, and
+/// cyclic aliases are rejected because they are not part of this profile or cannot be represented
+/// by JSON.
 /// </para>
 /// <para>
 /// The reflection based overloads (those accepting <see cref="JsonSerializerOptions"/>) require
@@ -42,6 +43,70 @@ namespace SVCSystems.Text.Json.Yaml;
 /// </example>
 public static class YamlSerializer
 {
+    /// <summary>A non-seekable UTF-8 prefix adapter that leaves its source stream open.</summary>
+    private sealed class PrefixStream(Stream inner, byte[] prefix) : Stream
+    {
+        private int _prefixOffset;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_prefixOffset < prefix.Length)
+            {
+                var length = Math.Min(count, prefix.Length - _prefixOffset);
+                prefix.AsSpan(_prefixOffset, length).CopyTo(buffer.AsSpan(offset, length));
+                _prefixOffset += length;
+                return length;
+            }
+
+            return inner.Read(buffer, offset, count);
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (_prefixOffset < prefix.Length)
+            {
+                var length = Math.Min(buffer.Length, prefix.Length - _prefixOffset);
+                prefix.AsSpan(_prefixOffset, length).CopyTo(buffer);
+                _prefixOffset += length;
+                return length;
+            }
+
+            return inner.Read(buffer);
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_prefixOffset < prefix.Length)
+            {
+                var length = Math.Min(buffer.Length, prefix.Length - _prefixOffset);
+                prefix.AsMemory(_prefixOffset, length).CopyTo(buffer);
+                _prefixOffset += length;
+                return ValueTask.FromResult(length);
+            }
+
+            return inner.ReadAsync(buffer, cancellationToken);
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The serializer does not own the caller's stream.
+            base.Dispose(disposing);
+        }
+    }
+
     #region Serialization
 
     /// <summary>
@@ -104,6 +169,68 @@ public static class YamlSerializer
     }
 
     /// <summary>
+    /// Serializes the specified value to UTF-8 encoded YAML bytes.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="JsonSerializer.SerializeToUtf8Bytes{TValue}(TValue, JsonSerializerOptions)"/> for YAML.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object serialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <returns>A UTF-8 encoded YAML representation of the value.</returns>
+    [RequiresUnreferencedCode("JSON serialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON serialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static byte[] SerializeToUtf8Bytes<T>(T value, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
+    {
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                JsonSerializer.Serialize(writer, value, jsonOptions);
+            }
+
+            return JsonToYamlConverter.ConvertToUtf8Bytes(buffer.WrittenSpan, yamlOptions);
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Serializes the specified value to UTF-8 encoded YAML bytes using the provided System.Text.Json contract.
+    /// </summary>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <returns>A UTF-8 encoded YAML representation of the value.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="jsonTypeInfo"/> is null.</exception>
+    public static byte[] SerializeToUtf8Bytes<T>(T value, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
+            }
+
+            return JsonToYamlConverter.ConvertToUtf8Bytes(buffer.WrittenSpan, yamlOptions);
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Serializes the specified value as YAML to the provided stream using the provided System.Text.Json contract.
     /// </summary>
     /// <typeparam name="T">The type of the value to serialize.</typeparam>
@@ -132,10 +259,9 @@ public static class YamlSerializer
 
             try
             {
-                using (var streamWriter = new StreamWriter(new PooledBufferStream(yamlBuffer), JsonToYamlConverter.Utf8NoBom, bufferSize: 1024, leaveOpen: true))
-                {
-                    JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, streamWriter, yamlOptions);
-                }
+                // The emitter's characters are UTF-8 encoded straight into pooled buffers, with
+                // no intermediate StreamWriter char buffer.
+                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
 
                 stream.Write(yamlBuffer.WrittenSpan);
             }
@@ -143,6 +269,86 @@ public static class YamlSerializer
             {
                 yamlBuffer.Dispose();
             }
+        }
+        finally
+        {
+            jsonBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Serializes the specified value as YAML to the provided stream.
+    /// </summary>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="stream">The stream to write YAML to. The stream is not closed or disposed.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object serialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> is null.</exception>
+    [RequiresUnreferencedCode("JSON serialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON serialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static void Serialize<T>(Stream stream, T value, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        var jsonBuffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
+            {
+                JsonSerializer.Serialize(jsonWriter, value, jsonOptions);
+            }
+
+            var yamlBuffer = new PooledBufferWriter();
+
+            try
+            {
+                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
+
+                stream.Write(yamlBuffer.WrittenSpan);
+            }
+            finally
+            {
+                yamlBuffer.Dispose();
+            }
+        }
+        finally
+        {
+            jsonBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Serializes the specified value as YAML into the provided <see cref="IBufferWriter{T}"/>
+    /// using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// The YAML is UTF-8 encoded directly into the buffers supplied by the writer; the writer is
+    /// neither closed nor disposed, and is left positioned after the written bytes. Object
+    /// serialization still stages the intermediate JSON token stream in pooled buffers.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="writer">The buffer writer to write UTF-8 encoded YAML to.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="writer"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
+    public static void Serialize<T>(IBufferWriter<byte> writer, T value, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+
+        var jsonBuffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
+            {
+                JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
+            }
+
+            JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, writer, yamlOptions);
         }
         finally
         {
@@ -212,7 +418,6 @@ public static class YamlSerializer
     public static T? Deserialize<T>(string yaml, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
     {
         ArgumentNullException.ThrowIfNull(yaml);
-        ValidateInputLength(yaml, yamlOptions);
 
         var buffer = new PooledBufferWriter();
 
@@ -246,7 +451,6 @@ public static class YamlSerializer
     {
         ArgumentNullException.ThrowIfNull(yaml);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
-        ValidateInputLength(yaml, yamlOptions);
 
         var buffer = new PooledBufferWriter();
 
@@ -281,7 +485,6 @@ public static class YamlSerializer
     {
         ArgumentNullException.ThrowIfNull(yaml);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
-        ValidateInputLength(yaml, yamlOptions);
 
         var buffer = new PooledBufferWriter();
 
@@ -315,6 +518,7 @@ public static class YamlSerializer
     /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
     /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    /// <exception cref="DecoderFallbackException">Thrown when the stream contains malformed UTF-8.</exception>
     public static T? Deserialize<T>(Stream stream, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -326,9 +530,173 @@ public static class YamlSerializer
         {
             using (var writer = new Utf8JsonWriter(buffer))
             {
-                using var reader = new StreamReader(stream, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 1024, leaveOpen: true);
-                var input = new LengthCheckingTextReader(reader, yamlOptions?.MaxInputLength ?? 0);
-                var parser = CreateParser(input, yamlOptions);
+                using var reader = CreateStrictUtf8StreamReader(stream);
+                var parser = CreateParser(reader, yamlOptions);
+                YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+            }
+
+            return JsonSerializer.Deserialize(buffer.WrittenSpan, jsonTypeInfo);
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deserializes a YAML stream read from the provided stream into an instance of type
+    /// <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="stream">The stream to read YAML from. The stream is not closed or disposed.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object deserialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    /// <exception cref="DecoderFallbackException">Thrown when the stream contains malformed UTF-8.</exception>
+    [RequiresUnreferencedCode("JSON deserialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON deserialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static T? Deserialize<T>(Stream stream, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                using var reader = CreateStrictUtf8StreamReader(stream);
+                var parser = CreateParser(reader, yamlOptions);
+                YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+            }
+
+            return JsonSerializer.Deserialize<T>(buffer.WrittenSpan, jsonOptions);
+        }
+        finally
+        {
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>.
+    /// </summary>
+    /// <remarks>
+    /// The bytes are decoded incrementally into characters as the YAML parser pulls them, so no
+    /// whole input UTF-16 string is materialized. A leading UTF-8 byte order mark is skipped;
+    /// malformed UTF-8 is rejected.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object deserialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    /// <exception cref="DecoderFallbackException">Thrown when the input contains malformed UTF-8.</exception>
+    [RequiresUnreferencedCode("JSON deserialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON deserialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static T? Deserialize<T>(ReadOnlyMemory<byte> utf8Yaml, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
+    {
+        return Deserialize<T>(utf8Yaml.Span, jsonOptions, yamlOptions);
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>
+    /// using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// The bytes are decoded incrementally into characters as the YAML parser pulls them, so no
+    /// whole input UTF-16 string is materialized. A leading UTF-8 byte order mark is skipped;
+    /// malformed UTF-8 is rejected.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="jsonTypeInfo"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    /// <exception cref="DecoderFallbackException">Thrown when the input contains malformed UTF-8.</exception>
+    public static T? Deserialize<T>(ReadOnlyMemory<byte> utf8Yaml, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
+    {
+        return Deserialize(new ReadOnlySequence<byte>(utf8Yaml), jsonTypeInfo, yamlOptions);
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>.
+    /// </summary>
+    /// <remarks>
+    /// The bytes are decoded incrementally into characters as the YAML parser pulls them, so no
+    /// whole input UTF-16 string is materialized. A leading UTF-8 byte order mark is skipped;
+    /// malformed UTF-8 is rejected.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object deserialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    /// <exception cref="DecoderFallbackException">Thrown when the input contains malformed UTF-8.</exception>
+    [RequiresUnreferencedCode("JSON deserialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON deserialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static T? Deserialize<T>(ReadOnlySpan<byte> utf8Yaml, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null)
+    {
+        // The input span is staged in a pooled buffer (the YAML scanner reads the input more than
+        // once, and a span cannot be re-read), then decoded incrementally.
+        var staging = new PooledBufferWriter();
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            var span = staging.GetSpan(utf8Yaml.Length);
+            utf8Yaml.CopyTo(span);
+            staging.Advance(utf8Yaml.Length);
+
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                using var reader = new SequenceTextReader(staging.WrittenMemory);
+                var parser = CreateParser(reader, yamlOptions);
+                YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+            }
+
+            return JsonSerializer.Deserialize<T>(buffer.WrittenSpan, jsonOptions);
+        }
+        finally
+        {
+            staging.Dispose();
+            buffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>
+    /// using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// The bytes are decoded incrementally into characters as the YAML parser pulls them, so no
+    /// whole input UTF-16 string is materialized. A leading UTF-8 byte order mark is skipped.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <returns>An instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="jsonTypeInfo"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    public static T? Deserialize<T>(ReadOnlySequence<byte> utf8Yaml, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+
+        var buffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                using var reader = new SequenceTextReader(utf8Yaml);
+                var parser = CreateParser(reader, yamlOptions);
                 YamlToJsonConverter.Convert(parser, writer, yamlOptions);
             }
 
@@ -346,29 +714,21 @@ public static class YamlSerializer
     /// <typeparam name="T">The type of the values to deserialize.</typeparam>
     /// <param name="yaml">The YAML stream to deserialize.</param>
     /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
-    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing. <see cref="YamlSerializerOptions.MaxDocuments"/> bounds the number of documents.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
     /// <returns>The deserialized documents, in stream order. An empty stream produces an empty list.</returns>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="yaml"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
-    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains more than <see cref="YamlSerializerOptions.MaxDocuments"/> documents.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid or uses unsupported YAML features.</exception>
     public static List<T?> DeserializeDocuments<T>(string yaml, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null)
     {
         ArgumentNullException.ThrowIfNull(yaml);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
-        ValidateInputLength(yaml, yamlOptions);
 
-        var maxDocuments = yamlOptions?.MaxDocuments ?? YamlSerializerOptions.DefaultMaxDocuments;
         var results = new List<T?>();
 
         var parser = CreateParser(yaml, yamlOptions);
 
         while (true)
         {
-            if (results.Count >= maxDocuments)
-            {
-                throw new YamlException(
-                    $"The YAML stream contains more than {maxDocuments} documents. Adjust {nameof(YamlSerializerOptions)}.{nameof(YamlSerializerOptions.MaxDocuments)} to allow more.");
-            }
-
             var buffer = new PooledBufferWriter();
 
             try
@@ -425,19 +785,16 @@ public static class YamlSerializer
 
         try
         {
-            using (var writer = new Utf8JsonWriter(jsonBuffer))
+            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
             {
-                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
+                JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
             }
 
             var yamlBuffer = new PooledBufferWriter();
 
             try
             {
-                using (var streamWriter = new StreamWriter(new PooledBufferStream(yamlBuffer), JsonToYamlConverter.Utf8NoBom, bufferSize: 1024, leaveOpen: true))
-                {
-                    JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, streamWriter, yamlOptions);
-                }
+                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
 
                 await stream.WriteAsync(yamlBuffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
             }
@@ -450,6 +807,81 @@ public static class YamlSerializer
         {
             jsonBuffer.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Serializes the specified value as YAML to the provided stream asynchronously.
+    /// </summary>
+    /// <remarks>
+    /// The stream write is asynchronous and honors <paramref name="cancellationToken"/>. Object
+    /// serialization and YAML conversion are synchronous CPU work.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="stream">The stream to write YAML to. The stream is not closed or disposed.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object serialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <param name="cancellationToken">A token that cancels the stream write.</param>
+    /// <returns>A task that completes when the YAML has been written.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> is null.</exception>
+    [RequiresUnreferencedCode("JSON serialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON serialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static async Task SerializeAsync<T>(Stream stream, T value, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        var jsonBuffer = new PooledBufferWriter();
+
+        try
+        {
+            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
+            {
+                JsonSerializer.Serialize(jsonWriter, value, jsonOptions);
+            }
+
+            var yamlBuffer = new PooledBufferWriter();
+
+            try
+            {
+                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
+
+                await stream.WriteAsync(yamlBuffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                yamlBuffer.Dispose();
+            }
+        }
+        finally
+        {
+            jsonBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Serializes the specified value as YAML into the provided <see cref="IBufferWriter{T}"/>
+    /// asynchronously using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// Writing to an <see cref="IBufferWriter{T}"/> is synchronous CPU work; the method completes
+    /// synchronously (the returned task is already completed) and
+    /// <paramref name="cancellationToken"/> is checked before serialization begins.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to serialize.</typeparam>
+    /// <param name="writer">The buffer writer to write UTF-8 encoded YAML to.</param>
+    /// <param name="value">The value to serialize.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML formatting.</param>
+    /// <param name="cancellationToken">A token checked before serialization begins.</param>
+    /// <returns>A task that completes when the YAML has been written.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="writer"/> or <paramref name="jsonTypeInfo"/> is null.</exception>
+    public static Task SerializeAsync<T>(IBufferWriter<byte> writer, T value, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Serialize(writer, value, jsonTypeInfo, yamlOptions);
+
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -474,20 +906,15 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
+        // The UTF-8 input is staged in pooled buffers (the YAML scanner reads the input more than
+        // once) and decoded incrementally into characters as the parser pulls them; no whole
+        // input UTF-16 string is materialized. A leading UTF-8 byte order mark is skipped by the
+        // reader, matching the previous decoded-BOM handling.
         var yamlBuffer = new PooledBufferWriter();
 
         try
         {
             await stream.CopyToAsync(new PooledBufferStream(yamlBuffer), cancellationToken).ConfigureAwait(false);
-
-            var yaml = Encoding.UTF8.GetString(yamlBuffer.WrittenSpan);
-
-            if (yaml.Length > 0 && yaml[0] == '\uFEFF')
-            {
-                yaml = yaml[1..];
-            }
-
-            ValidateInputLength(yaml, yamlOptions);
 
             var buffer = new PooledBufferWriter();
 
@@ -495,7 +922,8 @@ public static class YamlSerializer
             {
                 using (var writer = new Utf8JsonWriter(buffer))
                 {
-                    var parser = CreateParser(yaml, yamlOptions);
+                    using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
+                    var parser = CreateParser(reader, yamlOptions);
                     YamlToJsonConverter.Convert(parser, writer, yamlOptions);
                 }
 
@@ -512,7 +940,135 @@ public static class YamlSerializer
         }
     }
 
+    /// <summary>
+    /// Deserializes a YAML stream read from the provided stream asynchronously into an instance
+    /// of type <typeparamref name="T"/>.
+    /// </summary>
+    /// <remarks>
+    /// The stream read is asynchronous and honors <paramref name="cancellationToken"/>. YAML
+    /// parsing and object deserialization are synchronous CPU work performed after the stream has
+    /// been read.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="stream">The stream to read YAML from. The stream is not closed or disposed.</param>
+    /// <param name="jsonOptions">The <see cref="JsonSerializerOptions"/> controlling .NET object deserialization.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <param name="cancellationToken">A token that cancels the stream read.</param>
+    /// <returns>A task that completes with an instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="stream"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    [RequiresUnreferencedCode("JSON deserialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON deserialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static async Task<T?> DeserializeAsync<T>(Stream stream, JsonSerializerOptions? jsonOptions = null, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+
+        var yamlBuffer = new PooledBufferWriter();
+
+        try
+        {
+            await stream.CopyToAsync(new PooledBufferStream(yamlBuffer), cancellationToken).ConfigureAwait(false);
+
+            var buffer = new PooledBufferWriter();
+
+            try
+            {
+                using (var writer = new Utf8JsonWriter(buffer))
+                {
+                    using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
+                    var parser = CreateParser(reader, yamlOptions);
+                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                }
+
+                return JsonSerializer.Deserialize<T>(buffer.WrittenSpan, jsonOptions);
+            }
+            finally
+            {
+                buffer.Dispose();
+            }
+        }
+        finally
+        {
+            yamlBuffer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>
+    /// using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// Parsing UTF-8 bytes is synchronous CPU work; the method completes synchronously (the
+    /// returned task is already completed) and <paramref name="cancellationToken"/> is checked
+    /// before parsing begins. See the synchronous overload for the byte input semantics.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <param name="cancellationToken">A token checked before parsing begins.</param>
+    /// <returns>A task that completes with an instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="jsonTypeInfo"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    public static Task<T?> DeserializeAsync<T>(ReadOnlyMemory<byte> utf8Yaml, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return Task.FromResult(Deserialize(utf8Yaml, jsonTypeInfo, yamlOptions));
+    }
+
+    /// <summary>
+    /// Deserializes UTF-8 encoded YAML bytes into an instance of type <typeparamref name="T"/>
+    /// using the provided System.Text.Json contract.
+    /// </summary>
+    /// <remarks>
+    /// Parsing UTF-8 bytes is synchronous CPU work; the method completes synchronously (the
+    /// returned task is already completed) and <paramref name="cancellationToken"/> is checked
+    /// before parsing begins. See the synchronous overload for the byte input semantics.
+    /// </remarks>
+    /// <typeparam name="T">The type of the value to deserialize.</typeparam>
+    /// <param name="utf8Yaml">The UTF-8 encoded YAML to deserialize. The input is not modified.</param>
+    /// <param name="jsonTypeInfo">The <see cref="JsonTypeInfo{T}"/> contract, typically obtained from a source generated <see cref="JsonSerializerContext"/>.</param>
+    /// <param name="yamlOptions">The <see cref="YamlSerializerOptions"/> controlling YAML parsing.</param>
+    /// <param name="cancellationToken">A token checked before parsing begins.</param>
+    /// <returns>A task that completes with an instance of <typeparamref name="T"/> populated from the YAML input.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="jsonTypeInfo"/> is null.</exception>
+    /// <exception cref="YamlException">Thrown when the YAML is invalid, uses unsupported YAML features, or contains multiple documents.</exception>
+    public static Task<T?> DeserializeAsync<T>(ReadOnlySequence<byte> utf8Yaml, JsonTypeInfo<T> jsonTypeInfo, YamlSerializerOptions? yamlOptions = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return Task.FromResult(Deserialize(utf8Yaml, jsonTypeInfo, yamlOptions));
+    }
+
     #endregion
+
+    private static StreamReader CreateStrictUtf8StreamReader(Stream stream)
+    {
+        Span<byte> prefix = stackalloc byte[3];
+        var bytesRead = 0;
+
+        while (bytesRead < prefix.Length)
+        {
+            var read = stream.Read(prefix[bytesRead..]);
+            if (read == 0) break;
+            bytesRead += read;
+        }
+
+        var hasBom = bytesRead == 3
+            && prefix[0] == 0xEF
+            && prefix[1] == 0xBB
+            && prefix[2] == 0xBF;
+        var replay = hasBom ? [] : prefix[..bytesRead].ToArray();
+        var prefixedStream = new PrefixStream(stream, replay);
+
+        return new StreamReader(
+            prefixedStream,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true),
+            detectEncodingFromByteOrderMarks: false,
+            bufferSize: 1024,
+            leaveOpen: false);
+    }
 
     private static IParser CreateParser(string yaml, YamlSerializerOptions? yamlOptions)
     {
@@ -526,16 +1082,5 @@ public static class YamlSerializer
         return new AliasExpandingParser(
             parser,
             yamlOptions?.MaxAliasExpansionEvents ?? YamlSerializerOptions.DefaultMaxAliasExpansionEvents);
-    }
-
-    private static void ValidateInputLength(string yaml, YamlSerializerOptions? yamlOptions)
-    {
-        var maxInputLength = yamlOptions?.MaxInputLength ?? 0;
-
-        if (maxInputLength > 0 && yaml.Length > maxInputLength)
-        {
-            throw new YamlException(
-                $"The YAML input of {yaml.Length} characters exceeds the maximum input length of {maxInputLength}. Adjust {nameof(YamlSerializerOptions)}.{nameof(YamlSerializerOptions.MaxInputLength)} to allow larger inputs.");
-        }
     }
 }

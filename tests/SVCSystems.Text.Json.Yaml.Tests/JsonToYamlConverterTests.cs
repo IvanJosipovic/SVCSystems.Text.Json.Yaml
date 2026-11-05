@@ -50,7 +50,7 @@ public partial class JsonToYamlConverterTests
     [Fact]
     public void IndentationIsAppliedToNestedStructures()
     {
-        var yaml = JsonToYamlConverter.ConvertToString("""{"a":{"b":[1,2]}}"""u8, new YamlSerializerOptions { Indentation = 4 });
+        var yaml = JsonToYamlConverter.ConvertToString("""{"a":{"b":[1,2]}}"""u8, new YamlSerializerOptions { IndentSize = 4 });
 
         yaml.ReplaceLineEndings("\n").ShouldBe("a:\n    b:\n    - 1\n    - 2\n");
     }
@@ -111,6 +111,20 @@ public partial class JsonToYamlConverterTests
     public void InvalidJsonProducesUsefulErrors()
     {
         Should.Throw<JsonException>(() => JsonToYamlConverter.ConvertToString("""{"a":}"""u8));
+    }
+
+    [Fact]
+    public void RejectsDuplicateJsonObjectProperties()
+    {
+        Should.Throw<JsonException>(() => JsonToYamlConverter.ConvertToString("""{"a":1,"a":2}"""u8))
+            .Message.ShouldContain("duplicate property name 'a'");
+    }
+
+    [Fact]
+    public void RejectsNestedDuplicateJsonObjectProperties()
+    {
+        Should.Throw<JsonException>(() => JsonToYamlConverter.ConvertToString("""{"outer":{"a":1,"a":2}}"""u8))
+            .Message.ShouldContain("duplicate property name 'a'");
     }
 
     [JsonSerializable(typeof(JsonElement))]

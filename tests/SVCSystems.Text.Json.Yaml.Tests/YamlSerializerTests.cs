@@ -80,7 +80,7 @@ public partial class YamlSerializerTests
         ReflectionOnlyTests.SkipWhenReflectionUnavailable();
 
         var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
-        var yamlOptions = new YamlSerializerOptions { Indentation = 4, EmitDocumentStart = true };
+        var yamlOptions = new YamlSerializerOptions { IndentSize = 4, EmitDocumentStart = true };
 
         var yaml = YamlSerializer.Serialize(new Person { Name = "John", Age = 30 }, jsonOptions, yamlOptions);
 
@@ -216,7 +216,7 @@ public partial class YamlSerializerTests
         YamlScalarShouldBe("value: off", JsonValueKind.String, "off");
         YamlScalarShouldBe("value: y", JsonValueKind.String, "y");
         YamlScalarShouldBe("value: 00123", JsonValueKind.Number, raw: "123");
-        YamlScalarShouldBe("value: 1e3", JsonValueKind.Number, raw: "1000");
+        YamlScalarShouldBe("value: 1e3", JsonValueKind.Number, raw: "1e3");
         YamlScalarShouldBe("value: 1.20", JsonValueKind.Number, raw: "1.20");
         YamlScalarShouldBe("value: 0.1", JsonValueKind.Number, raw: "0.1");
         YamlScalarShouldBe("value: -7", JsonValueKind.Number, raw: "-7");
@@ -230,6 +230,51 @@ public partial class YamlSerializerTests
         YamlScalarShouldBe("value: NULL", JsonValueKind.Null);
         YamlScalarShouldBe("value:", JsonValueKind.Null);
         YamlScalarShouldBe("value: !!str 123", JsonValueKind.String, "123");
+    }
+
+    [Fact]
+    public void ResolvesPlainScalarsPerTheYamlJsonSchema()
+    {
+        var options = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+        foreach (var value in new[] { "text", "True", "~", "+42", "007", "0x1A", ".5" })
+        {
+            Should.Throw<YamlException>(() => YamlSerializer.Deserialize($"'value': {value}", AppJsonContext.Default.JsonElement, options));
+        }
+
+        var quoted = YamlSerializer.Deserialize("'value': 'text'", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        quoted.ValueKind.ShouldBe(JsonValueKind.String);
+        quoted.GetString().ShouldBe("text");
+
+        var explicitString = YamlSerializer.Deserialize("'value': !!str text", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        explicitString.ValueKind.ShouldBe(JsonValueKind.String);
+
+        var trueElement = YamlSerializer.Deserialize("'value': true", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        trueElement.ValueKind.ShouldBe(JsonValueKind.True);
+
+        var nullElement = YamlSerializer.Deserialize("'value': null", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        nullElement.ValueKind.ShouldBe(JsonValueKind.Null);
+
+        var numberElement = YamlSerializer.Deserialize("'value': -12.5e+2", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        numberElement.GetRawText().ShouldBe("-12.5e+2");
+
+        var trailingPoint = YamlSerializer.Deserialize("'value': 5.", AppJsonContext.Default.JsonElement, options).GetProperty("value");
+        trailingPoint.GetRawText().ShouldBe("5.0");
+    }
+
+    [Fact]
+    public void JsonSchemaEmissionQuotesJsonStringValuesAndKeys()
+    {
+        var schemaOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+        var value = JsonSerializer.Deserialize("""{"plain":"hello","ambiguous":"true"}""", AppJsonContext.Default.JsonElement);
+
+        var yaml = YamlSerializer.Serialize(value, AppJsonContext.Default.JsonElement, schemaOptions);
+        yaml.ShouldContain("'plain'");
+        yaml.ShouldContain("'hello'");
+        yaml.ShouldContain("'true'");
+
+        var result = YamlSerializer.Deserialize(yaml, AppJsonContext.Default.JsonElement, schemaOptions);
+        result.GetProperty("plain").GetString().ShouldBe("hello");
+        result.GetProperty("ambiguous").GetString().ShouldBe("true");
     }
 
     [Fact]
@@ -296,6 +341,19 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
+    public void RoundTripsCarriageReturnAndLineEndingStringsAcrossStyles()
+    {
+        foreach (var value in new[] { "before\rafter", "before\r\nafter", "before\n\rafter", "\r", "\r\n" })
+        {
+            foreach (var style in new[] { YamlStringStyle.Auto, YamlStringStyle.Literal, YamlStringStyle.DoubleQuoted })
+            {
+                var yaml = YamlSerializer.Serialize(value, AppJsonContext.Default.String, new YamlSerializerOptions { StringStyle = style });
+                YamlSerializer.Deserialize(yaml, AppJsonContext.Default.String).ShouldBe(value, $"style {style}");
+            }
+        }
+    }
+
+    [Fact]
     public void ExpandsAliases()
     {
         var result = YamlSerializer.Deserialize("""
@@ -320,87 +378,27 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
-    public void SupportsMergeKeys()
+    public void TreatsDoubleAngleKeysAsOrdinaryStrings()
     {
         var result = YamlSerializer.Deserialize("""
-            base: &base
-              Name: John
-              Age: 30
-            merged:
-              <<: *base
+            plain:
+              <<: value
+            quoted:
+              "<<": value
+            tagged:
+              !!str <<: value
             """, AppJsonContext.Default.JsonElement);
 
-        result.GetProperty("merged").GetProperty("Name").GetString().ShouldBe("John");
-        result.GetProperty("merged").GetProperty("Age").GetInt32().ShouldBe(30);
+        result.GetProperty("plain").GetProperty("<<").GetString().ShouldBe("value");
+        result.GetProperty("quoted").GetProperty("<<").GetString().ShouldBe("value");
+        result.GetProperty("tagged").GetProperty("<<").GetString().ShouldBe("value");
     }
 
     [Fact]
-    public void ExplicitKeysWinOverMergeKeys()
+    public void ExplicitMergeTagIsRejected()
     {
-        var result = YamlSerializer.Deserialize("""
-            base: &base
-              Name: John
-              Age: 30
-            merged:
-              Name: Jane
-              <<: *base
-            """, AppJsonContext.Default.JsonElement);
-
-        result.GetProperty("merged").GetProperty("Name").GetString().ShouldBe("Jane");
-        result.GetProperty("merged").GetProperty("Age").GetInt32().ShouldBe(30);
-    }
-
-    [Fact]
-    public void FirstMergeSourceWins()
-    {
-        var result = YamlSerializer.Deserialize("""
-            first: &first
-              Name: John
-            second: &second
-              Name: Jane
-            merged:
-              <<: [*first, *second]
-            """, AppJsonContext.Default.JsonElement);
-
-        result.GetProperty("merged").GetProperty("Name").GetString().ShouldBe("John");
-    }
-
-    [Fact]
-    public void MergeKeysCanBeDisabled()
-    {
-        var yamlOptions = new YamlSerializerOptions { AllowMergeKeys = false };
-
-        var exception = Should.Throw<YamlException>(() => YamlSerializer.Deserialize("""
-            base: &base
-              Name: John
-            merged:
-              <<: *base
-            """, AppJsonContext.Default.Person, yamlOptions));
-
-        exception.Message.ShouldContain("merge key");
-    }
-
-    [Fact]
-    public void RejectsMultipleMergeKeysInOneMapping()
-    {
-        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("""
-            base: &base
-              Name: John
-            merged:
-              <<: *base
-              <<: *base
-            """, AppJsonContext.Default.Person))
-            .Message.ShouldContain("at most one merge key");
-    }
-
-    [Fact]
-    public void RejectsMergeValuesThatAreNotMappings()
-    {
-        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("""
-            merged:
-              <<: 42
-            """, AppJsonContext.Default.Person))
-            .Message.ShouldContain("merge key");
+        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("value: !!merge <<", AppJsonContext.Default.JsonElement))
+            .Message.ShouldContain("not supported");
     }
 
     [Fact]
@@ -453,16 +451,12 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
-    public void BoundsTheNumberOfDocuments()
+    public void DeserializesStreamsWithMoreThanTheOldDefaultDocumentCount()
     {
-        var yamlOptions = new YamlSerializerOptions { MaxDocuments = 1 };
-
-        Should.Throw<YamlException>(() => YamlSerializer.DeserializeDocuments("""
-            Name: John
-            ---
-            Name: Jane
-            """, AppJsonContext.Default.Person, yamlOptions))
-            .Message.ShouldContain("more than 1 documents");
+        var yaml = string.Join("\n---\n", Enumerable.Range(0, 100).Select(i => $"{i}"));
+        var results = YamlSerializer.DeserializeDocuments(yaml, AppJsonContext.Default.Int32);
+        results.Count.ShouldBe(100);
+        results[99].ShouldBe(99);
     }
 
     [Fact]
@@ -640,19 +634,6 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
-    public async Task MaxInputLengthIsEnforcedOnTheAsyncOverload()
-    {
-        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
-
-        using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("Name: a-value-longer-than-ten\nAge: 1\n"));
-
-        var exception = await Should.ThrowAsync<YamlException>(() =>
-            YamlSerializer.DeserializeAsync(stream, AppJsonContext.Default.Person, yamlOptions));
-
-        exception.Message.ShouldContain("maximum input length");
-    }
-
-    [Fact]
     public void RejectsNullTypeInfo()
     {
         Should.Throw<ArgumentNullException>(() => YamlSerializer.Serialize(new Person(), (JsonTypeInfo<Person>)null!));
@@ -662,7 +643,7 @@ public partial class YamlSerializerTests
     [Fact]
     public void RejectsNullYamlInput()
     {
-        Should.Throw<ArgumentNullException>(() => YamlSerializer.Deserialize<Person>(null!));
+        Should.Throw<ArgumentNullException>(() => YamlSerializer.Deserialize<Person>((string)null!));
         Should.Throw<ArgumentNullException>(() => YamlSerializer.Deserialize((string)null!, AppJsonContext.Default.Person));
         Should.Throw<ArgumentNullException>(() => YamlSerializer.Deserialize((Stream)null!, AppJsonContext.Default.Person));
     }
@@ -686,20 +667,6 @@ public partial class YamlSerializerTests
             """, AppJsonContext.Default.Person));
 
         exception.Message.ShouldContain("duplicate mapping key");
-    }
-
-    [Fact]
-    public void ResolvesDuplicateKeysByUsingTheLastValueWhenAllowed()
-    {
-        var yamlOptions = new YamlSerializerOptions { AllowDuplicateKeys = true };
-
-        var result = YamlSerializer.Deserialize("""
-            Name: John
-            Name: Jane
-            """, AppJsonContext.Default.Person, yamlOptions);
-
-        result.ShouldNotBeNull();
-        result.Name.ShouldBe("Jane");
     }
 
     private static void YamlScalarShouldBe(string yaml, JsonValueKind kind, string? value = null, string? raw = null)

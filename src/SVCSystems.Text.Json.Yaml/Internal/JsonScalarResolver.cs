@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using YamlDotNet.Core;
 using YamlDotNet.Core.Events;
 using Scalar = YamlDotNet.Core.Events.Scalar;
@@ -8,45 +9,72 @@ using Scalar = YamlDotNet.Core.Events.Scalar;
 
 namespace SVCSystems.Text.Json.Yaml.Internal;
 
-/// <summary>
-/// Resolves YAML plain scalars into JSON token semantics.
-/// </summary>
-/// <remarks>
-/// YAML 1.1 and YAML 1.2 disagree on several scalar classes (for example <c>yes</c>, <c>on</c> and
-/// <c>~</c>). This resolver implements the YAML 1.2 core schema (the default
-/// <see cref="YamlScalarSchema.Core"/>):
-/// <list type="bullet">
-///   <item><description>Booleans are <c>true</c>/<c>false</c> in any capitalization; <c>yes</c>, <c>no</c>, <c>on</c> and <c>off</c> are strings.</description></item>
-///   <item><description>Null is an empty scalar, <c>null</c> (any capitalization) or <c>~</c>.</description></item>
-///   <item><description>Integers are optionally signed decimal digits; under the Core schema hexadecimal (<c>0x1A</c>) and octal (<c>0o17</c>) forms also resolve to integers. Leading zeros are interpreted as decimal (YAML 1.1 octal such as <c>00123</c> is parsed as the decimal number <c>123</c>); sexagesimal notation is a string.</description></item>
-///   <item><description>Floats are decimal numbers with optional exponent; <c>.nan</c> and <c>.inf</c> have no JSON representation and follow <see cref="SpecialFloatBehavior"/>.</description></item>
-///   <item><description>Timestamps such as <c>2026-01-01</c> have no JSON equivalent and remain strings.</description></item>
-///   <item><description>Quoted scalars are always strings.</description></item>
-/// </list>
-/// All numeric parsing is culture invariant.
-/// </remarks>
+internal enum JsonScalarKind
+{
+    Error,
+    String,
+    Null,
+    Boolean,
+    Integer,
+    Float,
+}
+
+/// <summary>Resolves YAML scalars for the YAML 1.2.2 Core and JSON schemas.</summary>
 internal static class JsonScalarResolver
 {
-    /// <summary>
-    /// Determines whether the plain scalar resolves to JSON <c>null</c>.
-    /// </summary>
-    public static bool IsNullScalar(string? value)
+    public static JsonScalarKind ResolveImplicit(Scalar scalar, YamlScalarSchema schema)
     {
-        return string.IsNullOrEmpty(value)
-            || value is "null" or "Null" or "NULL" or "~";
+        if (scalar.Style != ScalarStyle.Plain)
+        {
+            return JsonScalarKind.String;
+        }
+
+        var value = scalar.Value;
+
+        if (IsNullScalar(value, schema))
+        {
+            return JsonScalarKind.Null;
+        }
+
+        if (TryResolveBoolean(value, schema, out _))
+        {
+            return JsonScalarKind.Boolean;
+        }
+
+        if (IsIntegerScalar(value, schema))
+        {
+            return JsonScalarKind.Integer;
+        }
+
+        if (IsFloatScalar(value, schema) || (schema == YamlScalarSchema.Core && IsSpecialFloat(value)))
+        {
+            return JsonScalarKind.Float;
+        }
+
+        return schema == YamlScalarSchema.Json ? JsonScalarKind.Error : JsonScalarKind.String;
     }
 
-    /// <summary>
-    /// Determines whether the plain scalar resolves to a JSON boolean.
-    /// </summary>
-    public static bool TryResolveBoolean(string? value, out bool result)
+    public static bool IsNullScalar(string? value, YamlScalarSchema schema)
+    {
+        return schema == YamlScalarSchema.Core
+            ? string.IsNullOrEmpty(value) || value is "null" or "Null" or "NULL" or "~"
+            : value == "null";
+    }
+
+    public static bool TryResolveBoolean(string? value, YamlScalarSchema schema, out bool result)
     {
         switch (value)
         {
-            case "true" or "True" or "TRUE":
+            case "true":
                 result = true;
                 return true;
-            case "false" or "False" or "FALSE":
+            case "false":
+                result = false;
+                return true;
+            case "True" or "TRUE" when schema == YamlScalarSchema.Core:
+                result = true;
+                return true;
+            case "False" or "FALSE" when schema == YamlScalarSchema.Core:
                 result = false;
                 return true;
             default:
@@ -55,246 +83,361 @@ internal static class JsonScalarResolver
         }
     }
 
-    /// <summary>
-    /// Determines whether the plain scalar resolves to a JSON integer.
-    /// </summary>
-    public static bool IsIntegerScalar(string? value)
+    public static bool IsIntegerScalar(string? value, YamlScalarSchema schema)
     {
-        if (value is not { Length: > 0 })
+        if (schema == YamlScalarSchema.Json)
         {
-            return false;
+            return IsJsonInteger(value);
         }
 
-        var start = value[0] is '-' or '+' ? 1 : 0;
-
-        if (start == value.Length)
+        if (IsSignedDigits(value))
         {
-            return false;
+            return true;
         }
 
-        for (var i = start; i < value.Length; i++)
-        {
-            if (value[i] is < '0' or > '9')
-            {
-                return false;
-            }
-        }
-
-        return true;
+        return IsRadixInteger(value, "0x", IsHexDigit)
+            || IsRadixInteger(value, "0o", c => c is >= '0' and <= '7');
     }
 
-    /// <summary>
-    /// Determines whether the plain scalar resolves to a JSON floating point number.
-    /// </summary>
-    public static bool IsFloatScalar(string? value)
+    public static bool IsFloatScalar(string? value, YamlScalarSchema schema)
     {
-        if (value is not { Length: > 0 })
+        return schema == YamlScalarSchema.Json
+            ? IsJsonSchemaFloat(value)
+            : IsCoreFloat(value);
+    }
+
+    public static bool TryResolveTaggedBoolean(string value, YamlScalarSchema schema, out bool result)
+    {
+        return TryResolveBoolean(value, schema, out result);
+    }
+
+    public static bool IsSpecialFloat(string? value)
+    {
+        return value is ".nan" or ".NaN" or ".NAN"
+            or ".inf" or ".Inf" or ".INF"
+            or "+.inf" or "+.Inf" or "+.INF"
+            or "-.inf" or "-.Inf" or "-.INF";
+    }
+
+    public static bool NeedsQuoting(string? value, YamlScalarSchema schema = YamlScalarSchema.Core)
+    {
+        // The JSON schema has no plain-string fallback: unmatched plain scalars are errors.
+        if (schema == YamlScalarSchema.Json) return true;
+
+        if (string.IsNullOrEmpty(value)
+            || IsNullScalar(value, schema)
+            || TryResolveBoolean(value, schema, out _)
+            || IsIntegerScalar(value, schema)
+            || IsFloatScalar(value, schema))
         {
-            return false;
+            return true;
         }
 
+        return schema == YamlScalarSchema.Core && IsSpecialFloat(value);
+    }
+
+    public static string NormalizeInteger(string value)
+    {
+        var sign = 1;
+        var start = 0;
+
+        if (value[0] is '-' or '+')
+        {
+            sign = value[0] == '-' ? -1 : 1;
+            start = 1;
+        }
+
+        var digits = value.AsSpan(start);
+
+        if (digits.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            return (sign * ParseHexInteger(digits[2..])).ToString(CultureInfo.InvariantCulture);
+        }
+
+        if (digits.StartsWith("0o", StringComparison.OrdinalIgnoreCase))
+        {
+            return (sign * ParseOctalInteger(digits[2..])).ToString(CultureInfo.InvariantCulture);
+        }
+
+        var decimalValue = BigInteger.Parse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
+        return decimalValue.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Returns valid JSON number text equivalent to a schema-resolved YAML float.</summary>
+    public static string NormalizeFloat(string value)
+    {
         var start = value[0] is '-' or '+' ? 1 : 0;
+        var negative = value[0] == '-';
+        var exponentIndex = FindExponent(value, start);
+        var mantissaEnd = exponentIndex < 0 ? value.Length : exponentIndex;
+        var dotIndex = value.IndexOf('.', start, mantissaEnd - start);
+        var integerEnd = dotIndex < 0 ? mantissaEnd : dotIndex;
+        var integerStart = start;
 
-        if (start == value.Length)
+        while (integerStart < integerEnd - 1 && value[integerStart] == '0')
         {
-            return false;
+            integerStart++;
         }
 
-        var mantissaDigits = 0;
-        var exponentDigits = 0;
-        var sawDot = false;
-        var sawExponent = false;
+        var integerLength = integerEnd - integerStart;
+        var fractionStart = dotIndex < 0 ? mantissaEnd : dotIndex + 1;
+        var fractionLength = mantissaEnd - fractionStart;
+        var builder = new System.Text.StringBuilder(value.Length + 2);
 
-        for (var i = start; i < value.Length; i++)
+        if (negative)
         {
-            var c = value[i];
+            builder.Append('-');
+        }
 
-            if (c is >= '0' and <= '9')
+        if (integerLength == 0)
+        {
+            builder.Append('0');
+        }
+        else
+        {
+            builder.Append(value, integerStart, integerLength);
+        }
+
+        if (dotIndex >= 0 || exponentIndex < 0)
+        {
+            builder.Append('.');
+            if (fractionLength == 0)
             {
-                if (sawExponent)
-                {
-                    exponentDigits++;
-                }
-                else
-                {
-                    mantissaDigits++;
-                }
-            }
-            else if (c == '.' && !sawDot && !sawExponent)
-            {
-                sawDot = true;
-            }
-            else if ((c == 'e' || c == 'E') && !sawExponent && mantissaDigits > 0)
-            {
-                sawExponent = true;
-            }
-            else if ((c == '-' || c == '+') && sawExponent && exponentDigits == 0 && (value[i - 1] == 'e' || value[i - 1] == 'E'))
-            {
-                // exponent sign
+                builder.Append('0');
             }
             else
             {
-                return false;
+                builder.Append(value, fractionStart, fractionLength);
             }
         }
 
-        // Pure integers are handled by IsIntegerScalar; floats require a dot or an exponent.
-        return (sawDot || sawExponent) && mantissaDigits > 0 && (exponentDigits > 0 || !sawExponent);
-    }
-
-    /// <summary>
-    /// Determines whether a JSON string written as a plain YAML scalar could be misinterpreted
-    /// as a non-string value when parsed again with the given schema.
-    /// </summary>
-    public static bool NeedsQuoting(string? value, YamlScalarSchema schema = YamlScalarSchema.Core)
-    {
-        return string.IsNullOrEmpty(value)
-            || IsNullScalar(value)
-            || TryResolveBoolean(value, out _)
-            || IsIntegerScalar(value)
-            || IsFloatScalar(value)
-            || (schema == YamlScalarSchema.Core && (IsHexIntegerScalar(value) || IsOctalIntegerScalar(value)));
-    }
-
-    /// <summary>
-    /// Throws when the scalar uses a YAML 1.1 special float that has no lossless JSON representation.
-    /// </summary>
-    public static void RejectSpecialFloats(Scalar scalar)
-    {
-        if (scalar.Style == ScalarStyle.Plain && IsSpecialFloat(scalar.Value))
+        if (exponentIndex >= 0)
         {
-            throw new YamlException(scalar.Start, scalar.End,
-                $"The scalar '{scalar.Value}' is not supported because it has no JSON number representation. Quote the value ('\"{scalar.Value}\"') to treat it as a string.");
-        }
-    }
-
-    /// <summary>
-    /// Determines whether the plain scalar is a YAML special float (<c>.inf</c>, <c>.nan</c> and
-    /// their signed and capitalized forms), which has no JSON number representation.
-    /// </summary>
-    public static bool IsSpecialFloat(string? value)
-    {
-        return value is ".nan" or ".NaN" or ".NAN" or
-            ".inf" or ".Inf" or ".INF" or
-            "+.inf" or "+.Inf" or "+.INF" or
-            "-.inf" or "-.Inf" or "-.INF";
-    }
-
-    /// <summary>
-    /// Determines whether the plain scalar is a hexadecimal integer per the YAML 1.2 core schema
-    /// (<c>0x1A</c>, <c>-0x1A</c>).
-    /// </summary>
-    public static bool IsHexIntegerScalar(string? value)
-    {
-        return IsRadixIntegerScalar(value, "0x", "0X", IsHexDigit);
-    }
-
-    /// <summary>
-    /// Determines whether the plain scalar is an octal integer per the YAML 1.2 core schema
-    /// (<c>0o17</c>, <c>-0o17</c>).
-    /// </summary>
-    public static bool IsOctalIntegerScalar(string? value)
-    {
-        return IsRadixIntegerScalar(value, "0o", "0O", c => c is >= '0' and <= '7');
-    }
-
-    private static bool IsRadixIntegerScalar(string? value, string lowerPrefix, string upperPrefix, Func<char, bool> isDigit)
-    {
-        if (value is not { Length: > 2 })
-        {
-            return false;
+            builder.Append(value.AsSpan(exponentIndex));
         }
 
+        return builder.ToString();
+    }
+
+    /// <summary>Canonical decimal identity used for YAML float mapping keys.</summary>
+    public static string CanonicalFloat(string value)
+    {
+        var normalized = NormalizeFloat(value);
+        var index = normalized[0] == '-' ? 1 : 0;
+        var exponentIndex = FindExponent(normalized, index);
+        var mantissaEnd = exponentIndex < 0 ? normalized.Length : exponentIndex;
+        var dotIndex = normalized.IndexOf('.', index, mantissaEnd - index);
+        var fractionDigits = dotIndex < 0 ? 0 : mantissaEnd - dotIndex - 1;
+        var digits = new System.Text.StringBuilder(mantissaEnd - index);
+
+        for (var i = index; i < mantissaEnd; i++)
+        {
+            if (normalized[i] != '.')
+            {
+                digits.Append(normalized[i]);
+            }
+        }
+
+        var allDigits = digits.ToString();
+        var firstNonZero = 0;
+        while (firstNonZero < allDigits.Length && allDigits[firstNonZero] == '0')
+        {
+            firstNonZero++;
+        }
+
+        if (firstNonZero == allDigits.Length)
+        {
+            return "0";
+        }
+
+        var last = allDigits.Length;
+        while (last > firstNonZero && allDigits[last - 1] == '0')
+        {
+            last--;
+        }
+
+        var exponent = exponentIndex < 0
+            ? BigInteger.Zero
+            : BigInteger.Parse(normalized.AsSpan(exponentIndex + 1), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
+        exponent -= fractionDigits;
+        exponent += allDigits.Length - last;
+
+        return (normalized[0] == '-' ? "-" : "")
+            + allDigits[firstNonZero..last]
+            + "e"
+            + exponent.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static bool IsSignedDigits(string? value)
+    {
+        if (value is not { Length: > 0 }) return false;
         var start = value[0] is '-' or '+' ? 1 : 0;
+        if (start == value.Length) return false;
+        for (var i = start; i < value.Length; i++)
+        {
+            if (value[i] is < '0' or > '9') return false;
+        }
+        return true;
+    }
 
-        if (!value.AsSpan(start).StartsWith(lowerPrefix) && !value.AsSpan(start).StartsWith(upperPrefix))
+    private static bool IsJsonInteger(string? value)
+    {
+        if (value is not { Length: > 0 }) return false;
+        var start = value[0] == '-' ? 1 : 0;
+        if (start == value.Length) return false;
+        if (value[start] == '0') return start + 1 == value.Length;
+        if (value[start] is < '1' or > '9') return false;
+        for (var i = start + 1; i < value.Length; i++)
+        {
+            if (value[i] is < '0' or > '9') return false;
+        }
+        return true;
+    }
+
+    private static bool IsJsonSchemaFloat(string? value)
+    {
+        if (value is not { Length: > 0 }) return false;
+        var i = value[0] == '-' ? 1 : 0;
+        if (i == value.Length) return false;
+
+        if (value[i] == '0')
+        {
+            i++;
+        }
+        else if (value[i] is >= '1' and <= '9')
+        {
+            do { i++; } while (i < value.Length && value[i] is >= '0' and <= '9');
+        }
+        else
         {
             return false;
         }
 
-        var digits = value.AsSpan(start + 2);
-
-        if (digits.Length == 0)
+        var hasFractionOrExponent = false;
+        if (i < value.Length && value[i] == '.')
         {
-            return false;
+            hasFractionOrExponent = true;
+            i++;
+            while (i < value.Length && value[i] is >= '0' and <= '9') i++;
         }
 
+        if (i < value.Length && value[i] is 'e' or 'E')
+        {
+            hasFractionOrExponent = true;
+            i++;
+            if (i < value.Length && value[i] is '+' or '-') i++;
+            var exponentStart = i;
+            while (i < value.Length && value[i] is >= '0' and <= '9') i++;
+            if (i == exponentStart) return false;
+        }
+
+        return hasFractionOrExponent && i == value.Length;
+    }
+
+    private static bool IsCoreFloat(string? value)
+    {
+        if (value is not { Length: > 0 }) return false;
+        var start = value[0] is '-' or '+' ? 1 : 0;
+        if (start == value.Length) return false;
+
+        var exponentIndex = FindExponent(value, start);
+        var mantissaEnd = exponentIndex < 0 ? value.Length : exponentIndex;
+        var dotIndex = value.IndexOf('.', start, mantissaEnd - start);
+        var digitCount = 0;
+
+        for (var i = start; i < mantissaEnd; i++)
+        {
+            if (value[i] is >= '0' and <= '9') digitCount++;
+            else if (value[i] != '.' || i != dotIndex) return false;
+        }
+
+        if (digitCount == 0 || (dotIndex < 0 && exponentIndex < 0)) return false;
+        if (exponentIndex < 0) return true;
+
+        var iExponent = exponentIndex + 1;
+        if (iExponent < value.Length && value[iExponent] is '+' or '-') iExponent++;
+        if (iExponent == value.Length) return false;
+        for (var i = iExponent; i < value.Length; i++)
+        {
+            if (value[i] is < '0' or > '9') return false;
+        }
+        return true;
+    }
+
+    private static bool IsRadixInteger(string? value, string prefix, Func<char, bool> isDigit)
+    {
+        if (value is not { Length: > 2 }) return false;
+        var span = value.AsSpan();
+        if (!span.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var digits = span[prefix.Length..];
+        if (digits.IsEmpty) return false;
         foreach (var c in digits)
         {
-            if (!isDigit(c))
+            if (!isDigit(c)) return false;
+        }
+        return true;
+    }
+
+    private static BigInteger ParseHexInteger(ReadOnlySpan<char> digits)
+    {
+        // Hexadecimal is a power-of-two radix. Pack the nibbles directly into an unsigned
+        // little-endian byte buffer instead of repeatedly multiplying a growing BigInteger.
+        var bytes = new byte[(int)(((long)digits.Length + 1) / 2)];
+        var byteIndex = 0;
+
+        for (var index = digits.Length; index > 0;)
+        {
+            var low = HexDigitValue(digits[--index]);
+            var high = index > 0 ? HexDigitValue(digits[--index]) : 0;
+            bytes[byteIndex++] = (byte)((high << 4) | low);
+        }
+
+        return new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+    }
+
+    private static BigInteger ParseOctalInteger(ReadOnlySpan<char> digits)
+    {
+        // Octal digits contain exactly three bits. Pack them directly into an unsigned
+        // little-endian byte buffer so parsing remains linear in the input length.
+        var byteLength = checked((int)(((long)digits.Length * 3 + 7) / 8));
+        var bytes = new byte[byteLength];
+        var byteIndex = 0;
+        var accumulator = 0;
+        var bitsInAccumulator = 0;
+
+        for (var index = digits.Length - 1; index >= 0; index--)
+        {
+            accumulator |= (digits[index] - '0') << bitsInAccumulator;
+            bitsInAccumulator += 3;
+
+            if (bitsInAccumulator >= 8)
             {
-                return false;
+                bytes[byteIndex++] = (byte)accumulator;
+                accumulator >>= 8;
+                bitsInAccumulator -= 8;
             }
         }
 
-        return true;
+        if (bitsInAccumulator > 0)
+        {
+            bytes[byteIndex] = (byte)accumulator;
+        }
+
+        return new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+    }
+
+    private static int HexDigitValue(char value) => value is >= '0' and <= '9'
+        ? value - '0'
+        : (value | 0x20) - 'a' + 10;
+
+    private static int FindExponent(string value, int start)
+    {
+        for (var i = start; i < value.Length; i++)
+        {
+            if (value[i] is 'e' or 'E') return i;
+        }
+        return -1;
     }
 
     private static bool IsHexDigit(char c) => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F';
-
-    /// <summary>
-    /// Determines whether the plain scalar resolves to a floating point number under the YAML 1.2
-    /// core schema, which additionally allows forms such as <c>.5</c> and <c>1.</c>.
-    /// </summary>
-    public static bool IsCoreFloatScalar(string? value)
-    {
-        return IsFloatScalar(value) || IsMantissaOnlyFloatScalar(value);
-    }
-
-    /// <summary>
-    /// Matches the core schema float forms that consist of a mantissa with a dot but no exponent:
-    /// <c>.5</c>, <c>-.5</c>, <c>+5.</c> and so on. <see cref="double"/> and <see cref="decimal"/>
-    /// parse these forms natively.
-    /// </summary>
-    private static bool IsMantissaOnlyFloatScalar(string? value)
-    {
-        if (value is not { Length: > 1 })
-        {
-            return false;
-        }
-
-        var start = value[0] is '-' or '+' ? 1 : 0;
-        var digits = value.AsSpan(start);
-
-        // The mantissa must contain at least one digit and exactly one dot: ".5" or "5.".
-        var dotCount = 0;
-        var digitCount = 0;
-
-        foreach (var c in digits)
-        {
-            if (c is >= '0' and <= '9')
-            {
-                digitCount++;
-            }
-            else if (c == '.')
-            {
-                dotCount++;
-            }
-            else
-            {
-                return false;
-            }
-        }
-
-        return digitCount > 0 && dotCount == 1;
-    }
-
-    /// <summary>
-    /// Parses a float scalar using invariant culture, preferring <see cref="decimal"/> to preserve precision.
-    /// </summary>
-    public static bool TryParseNumber(string value, out decimal decimalValue, out double doubleValue)
-    {
-        if (decimal.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out decimalValue))
-        {
-            doubleValue = 0;
-            return true;
-        }
-
-        if (double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out doubleValue))
-        {
-            return true;
-        }
-
-        return false;
-    }
 }

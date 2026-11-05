@@ -23,7 +23,7 @@ public partial class YamlToJsonConverterTests
     [InlineData("value: 007", "7")]
     [InlineData("value: 1.25", "1.25")]
     [InlineData("value: 1.20", "1.20")]
-    [InlineData("value: 1e5", "100000")]
+    [InlineData("value: 1e5", "1e5")]
     [InlineData("value: \"1.20\"", "\"1.20\"")]
     [InlineData("value: '1.20'", "\"1.20\"")]
     [InlineData("value: null", "null")]
@@ -85,20 +85,6 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
-    public void AllowsDuplicateKeysWhenConfigured()
-    {
-        var json = ConvertToJson("""
-            a: 1
-            b: 2
-            a: 3
-            """, new YamlSerializerOptions { AllowDuplicateKeys = true });
-
-        json.ShouldContain("\"a\":1");
-        json.ShouldContain("\"b\":2");
-        json.ShouldContain("\"a\":3");
-    }
-
-    [Fact]
     public void TracksDuplicateKeysPerMappingLevel()
     {
         // The same key in sibling mappings is not a duplicate.
@@ -117,13 +103,31 @@ public partial class YamlToJsonConverterTests
     [Fact]
     public void ScalarMappingKeysAreWrittenAsJsonStringKeys()
     {
-        // Plain scalar keys keep their source text as the JSON property name, so typed
-        // dictionary key converters in System.Text.Json can resolve them.
+        // Supported scalar keys are projected to canonical JSON property names.
         ConvertToJson("1: a").ShouldBe("{\"1\":\"a\"}");
         ConvertToJson("true: a").ShouldBe("{\"true\":\"a\"}");
+        ConvertToJson("01: a").ShouldBe("{\"1\":\"a\"}");
 
         // Complex keys (sequences or mappings used as keys) are rejected.
         Should.Throw<YamlException>(() => ConvertToJson("? [1, 2]\n: value")).Message.ShouldContain("Complex mapping keys");
+    }
+
+    [Theory]
+    [InlineData("1: a\n01: b")]
+    [InlineData("true: a\nTrue: b")]
+    [InlineData("1.0: a\n1e0: b")]
+    public void RejectsDuplicateKeysByYamlTagAndCanonicalValue(string yaml)
+    {
+        Should.Throw<YamlException>(() => ConvertToJson(yaml)).Message.ShouldContain("duplicate mapping key");
+    }
+
+    [Fact]
+    public void RejectsDifferentYamlKeysThatCollideAsJsonNames()
+    {
+        Should.Throw<YamlException>(() => ConvertToJson("true: boolean\n\"true\": string"))
+            .Message.ShouldContain("collides with another key");
+        Should.Throw<YamlException>(() => ConvertToJson("1: integer\n\"1\": string"))
+            .Message.ShouldContain("collides with another key");
     }
 
     [Fact]
@@ -165,10 +169,57 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void ReplayedNestedAnchorDoesNotReplaceALaterSourceDeclaration()
+    {
+        var json = ConvertToJson("""
+            root: &root
+              nested: &value old
+            latest: &value new
+            copy: *root
+            alias: *value
+            """);
+
+        json.ShouldContain("\"latest\":\"new\"");
+        json.ShouldContain("\"copy\":{\"nested\":\"old\"}");
+        json.ShouldContain("\"alias\":\"new\"");
+    }
+
+    [Fact]
     public void RejectsUndefinedAliases()
     {
         Should.Throw<YamlException>(() => ConvertToJson("copy: *missing"))
             .Message.ShouldContain("missing");
+    }
+
+    [Fact]
+    public void RejectsCyclicAliasesAsUnrepresentableByJson()
+    {
+        Should.Throw<YamlException>(() => ConvertToJson("self: &node {next: *node}"))
+            .Message.ShouldContain("cyclic YAML graph");
+    }
+
+    [Fact]
+    public void ReusedAnchorNameBindsAliasesToItsMostRecentDefinition()
+    {
+        var json = ConvertToJson("""
+            outer: &same
+              first: one
+              inner: &same
+                value: two
+              copy: *same
+            after: *same
+            """);
+
+        json.ShouldContain("\"copy\":{\"value\":\"two\"}");
+        json.ShouldContain("\"after\":{\"value\":\"two\"}");
+    }
+
+    [Fact]
+    public void ExplicitScalarTagsApplyToQuotedValues()
+    {
+        ConvertToJson("value: !!int \"3\"").ShouldBe("{\"value\":3}");
+        ConvertToJson("value: !!bool 'true'").ShouldBe("{\"value\":true}");
+        ConvertToJson("value: !!null \"null\"").ShouldBe("{\"value\":null}");
     }
 
     [Fact]
@@ -279,32 +330,69 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
-    public void CoreSchemaResolvesHexOctalAndLooseFloatForms()
+    public void CoreAndJsonSchemasUseTheirYamlResolutionRules()
     {
         // Core is the default schema.
         ConvertToJson("value: 0x1A").ShouldBe("{\"value\":26}");
-        ConvertToJson("value: -0x1A").ShouldBe("{\"value\":-26}");
         ConvertToJson("value: 0o17").ShouldBe("{\"value\":15}");
+        ConvertToJson("value: -0x1A").ShouldBe("{\"value\":\"-0x1A\"}");
+        JsonDocument.Parse(ConvertToJson("value: +0o17")).RootElement.GetProperty("value").GetString().ShouldBe("+0o17");
+        ConvertToJson("value: 0X1A").ShouldBe("{\"value\":\"0X1A\"}");
+        ConvertToJson("value: 0O17").ShouldBe("{\"value\":\"0O17\"}");
 
-        // The JSON restricted schema keeps hexadecimal and octal forms as strings.
+        // JSON schema leaves no implicit plain-string fallback. Values not matching its scalar
+        // patterns are errors; JSON strings must be quoted or explicitly tagged.
         var jsonSchema = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
 
-        ConvertToJson("value: 0x1A", jsonSchema).ShouldBe("{\"value\":\"0x1A\"}");
-        ConvertToJson("value: 0o17", jsonSchema).ShouldBe("{\"value\":\"0o17\"}");
+        foreach (var value in new[] { "hello", "0x1A", "0o17", "True", "~", "+42", "007", ".5" })
+        {
+            Should.Throw<YamlException>(() => ConvertToJson($"'value': {value}", jsonSchema));
+        }
+
+        Should.Throw<YamlException>(() => ConvertToJson("plain: 'text'", jsonSchema))
+            .Message.ShouldContain("does not match the YAML 1.2 JSON schema");
+
+        ConvertToJson("'value': 'hello'", jsonSchema).ShouldBe("{\"value\":\"hello\"}");
+        ConvertToJson("'value': !!str hello", jsonSchema).ShouldBe("{\"value\":\"hello\"}");
+        ConvertToJson("'value': true", jsonSchema).ShouldBe("{\"value\":true}");
+        ConvertToJson("'value': null", jsonSchema).ShouldBe("{\"value\":null}");
+        ConvertToJson("'value': 5.", jsonSchema).ShouldBe("{\"value\":5.0}");
+        ConvertToJson("'value': 1e3", jsonSchema).ShouldBe("{\"value\":1e3}");
+        ConvertToJson("'value': -0.25e+2", jsonSchema).ShouldBe("{\"value\":-0.25e+2}");
     }
 
     [Fact]
-    public void LooseFloatFormsResolveUnderBothSchemas()
+    public void PlainMergeLookingScalarDependsOnSchemaAndExplicitStringFormDoesNot()
+    {
+        var jsonSchema = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+
+        ConvertToJson("plain: {<<: 'value'}").ShouldBe("{\"plain\":{\"\\u003C\\u003C\":\"value\"}}");
+        Should.Throw<YamlException>(() => ConvertToJson("'plain': {<<: 'value'}", jsonSchema));
+        ConvertToJson("'plain': {'<<': 'value'}", jsonSchema)
+            .ShouldBe("{\"plain\":{\"\\u003C\\u003C\":\"value\"}}");
+        ConvertToJson("'plain': {!!str <<: 'value'}", jsonSchema)
+            .ShouldBe("{\"plain\":{\"\\u003C\\u003C\":\"value\"}}");
+    }
+
+    [Fact]
+    public void LooseFloatFormsResolveOnlyUnderCoreSchema()
     {
         ConvertToJson("value: .5").ShouldBe("{\"value\":0.5}");
-        ConvertToJson("value: 5.").ShouldBe("{\"value\":5}");
+        ConvertToJson("value: 5.").ShouldBe("{\"value\":5.0}");
         ConvertToJson("value: -.5").ShouldBe("{\"value\":-0.5}");
 
-        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
+        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
 
-        ConvertToJson("value: .5", yamlOptions).ShouldBe("{\"value\":0.5}");
-        ConvertToJson("value: 5.", yamlOptions).ShouldBe("{\"value\":5}");
-        ConvertToJson("value: -.5", yamlOptions).ShouldBe("{\"value\":-0.5}");
+        Should.Throw<YamlException>(() => ConvertToJson("'value': .5", yamlOptions));
+        ConvertToJson("'value': 5.", yamlOptions).ShouldBe("{\"value\":5.0}");
+        Should.Throw<YamlException>(() => ConvertToJson("'value': -.5", yamlOptions));
+    }
+
+    [Fact]
+    public void PreservesNegativeZeroWhenProjectingIntegerScalars()
+    {
+        ConvertToJson("value: -0").ShouldBe("{\"value\":-0}");
+        ConvertToJson("value: -00").ShouldBe("{\"value\":-0}");
     }
 
     [Fact]
@@ -317,43 +405,80 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
-    public void SpecialFloatsCanBeResolvedToStrings()
+    public void CoreSchemaResolvesLongRadixIntegersWithoutLosingPrecision()
     {
-        var yamlOptions = new YamlSerializerOptions { SpecialFloats = SpecialFloatBehavior.String };
+        var digits = new string('7', 4096);
+        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
+        var expected = System.Numerics.BigInteger.Pow(8, digits.Length) - 1;
 
-        ConvertToJson("value: .inf", yamlOptions).ShouldBe("{\"value\":\".inf\"}");
-        ConvertToJson("value: -.inf", yamlOptions).ShouldBe("{\"value\":\"-.inf\"}");
-        ConvertToJson("value: .nan", yamlOptions).ShouldBe("{\"value\":\".nan\"}");
-
-        // Rejection remains the default.
-        Should.Throw<YamlException>(() => ConvertToJson("value: .inf"));
+        ConvertToJson($"value: 0o{digits}", yamlOptions)
+            .ShouldBe($"{{\"value\":{expected.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}");
     }
 
     [Fact]
-    public void UnknownTagsCanBeIgnored()
+    public void BothSchemasRejectSpecialFloats()
     {
-        var yamlOptions = new YamlSerializerOptions { UnknownTags = UnknownTagBehavior.Ignore };
+        var jsonSchema = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+        foreach (var value in new[] { ".inf", "+.INF", "-.Inf", ".nan", "+.NaN", "-.NAN" })
+        {
+            Should.Throw<YamlException>(() => ConvertToJson($"value: {value}", jsonSchema));
+        }
 
-        // A custom tag asserts an application specific type with no JSON mapping; the scalar is
-        // resolved conservatively to its exact text as a string.
-        ConvertToJson("value: !Custom 123", yamlOptions).ShouldBe("{\"value\":\"123\"}");
-        ConvertToJson("value: !Custom hello", yamlOptions).ShouldBe("{\"value\":\"hello\"}");
+        foreach (var value in new[] { ".inf", "+.INF", "-.Inf", ".nan", ".NaN", ".NAN" })
+        {
+            Should.Throw<YamlException>(() => ConvertToJson($"value: {value}"));
+        }
 
-        // Rejection remains the default.
+        foreach (var value in new[] { "+.NaN", "-.NAN" })
+        {
+            JsonDocument.Parse(ConvertToJson($"value: {value}")).RootElement.GetProperty("value").GetString().ShouldBe(value);
+        }
+    }
+
+    [Fact]
+    public void ExplicitNonSpecificTagForcesStringResolution()
+    {
+        ConvertToJson("'value': ! 12", new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json })
+            .ShouldBe("{\"value\":\"12\"}");
+    }
+
+    [Theory]
+    [InlineData("1e999999999999999999999999")]
+    [InlineData("1e-999999999999999999999999")]
+    [InlineData("0.123456789012345678901234567890123456789")]
+    public void PreservesFloatMagnitudeAndPrecisionExactly(string yamlScalar)
+    {
+        ConvertToJson($"value: {yamlScalar}").ShouldBe($"{{\"value\":{yamlScalar}}}");
+    }
+
+    [Fact]
+    public void UnsupportedTagsAreAlwaysRejected()
+    {
         Should.Throw<YamlException>(() => ConvertToJson("value: !Custom 123"))
+            .Message.ShouldContain("not supported");
+        Should.Throw<YamlException>(() => ConvertToJson("value: !Custom [1, 2]"))
             .Message.ShouldContain("not supported");
     }
 
     [Fact]
-    public void BinaryAndTimestampTagsAreOptIn()
+    public void BinaryAndTimestampTagsAreUnsupported()
     {
         Should.Throw<YamlException>(() => ConvertToJson("value: !!binary aGVsbG8=")).Message.ShouldContain("not supported");
         Should.Throw<YamlException>(() => ConvertToJson("value: !!timestamp 2026-01-01T00:00:00Z")).Message.ShouldContain("not supported");
+    }
 
-        var allow = new YamlSerializerOptions { AllowBinaryTag = true, AllowTimestampTag = true };
+    [Fact]
+    public void ValidatesTagsOnCollectionsAndSupportsYamlTagDirectives()
+    {
+        Should.Throw<YamlException>(() => ConvertToJson("value: !!str [one, two]"))
+            .Message.ShouldContain("not supported on a sequence");
+        Should.Throw<YamlException>(() => ConvertToJson("value: !!set {one: null}"))
+            .Message.ShouldContain("not supported on a mapping");
 
-        ConvertToJson("value: !!binary aGVsbG8=", allow).ShouldBe("{\"value\":\"aGVsbG8=\"}");
-        ConvertToJson("value: !!timestamp 2026-01-01T00:00:00Z", allow).ShouldBe("{\"value\":\"2026-01-01T00:00:00Z\"}");
+        ConvertToJson("%TAG !e! tag:yaml.org,2002:\n---\nvalue: !e!int 42").ShouldBe("{\"value\":42}");
+        ConvertToJson("%YAML 1.2\n---\nvalue: true").ShouldBe("{\"value\":true}");
+        Should.Throw<YamlException>(() => ConvertToJson("%YAML 1.1\n---\nvalue: true"))
+            .Message.ShouldContain("YAML version 1.1 is not supported");
     }
 
     [Fact]
@@ -364,15 +489,6 @@ public partial class YamlToJsonConverterTests
         ConvertToJson("k: ab", yamlOptions).ShouldBe("{\"k\":\"ab\"}");
         Should.Throw<YamlException>(() => ConvertToJson("key: longer-value", yamlOptions))
             .Message.ShouldContain("maximum scalar length");
-    }
-
-    [Fact]
-    public void BoundsInputLength()
-    {
-        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
-
-        Should.Throw<YamlException>(() => YamlSerializer.Deserialize("a: a-longer-value", TestJsonContext.Default.JsonElement, yamlOptions))
-            .Message.ShouldContain("maximum input length");
     }
 
     [Fact]
