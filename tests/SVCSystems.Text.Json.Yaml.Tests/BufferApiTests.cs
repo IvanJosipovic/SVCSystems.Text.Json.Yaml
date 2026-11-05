@@ -23,6 +23,7 @@ public partial class BufferApiTests
 
     [JsonSerializable(typeof(Person))]
     [JsonSerializable(typeof(string))]
+    [JsonSerializable(typeof(JsonElement))]
     internal sealed partial class BufferJsonContext : JsonSerializerContext;
 
     private static JsonTypeInfo<T> TypeInfo<T>(Func<BufferJsonContext, JsonTypeInfo<T>> selector)
@@ -89,6 +90,17 @@ public partial class BufferApiTests
     public void RejectsUnpairedHighSurrogateOnFlush()
     {
         Should.Throw<EncoderFallbackException>(() => WrittenBytes(w => w.Write('\ud83c')));
+    }
+
+    [Fact]
+    public void EmptySpanDoesNotBreakASurrogatePairAcrossWrites()
+    {
+        WrittenBytes(w =>
+        {
+            w.Write('\ud83c');
+            w.Write(ReadOnlySpan<char>.Empty);
+            w.Write('\udf89');
+        }).ShouldBe(Encoding.UTF8.GetBytes("\U0001F389"));
     }
 
     [Fact]
@@ -268,11 +280,19 @@ public partial class BufferApiTests
     [Fact]
     public void SkipsUtf8ByteOrderMark()
     {
-        var reader = new SequenceTextReader(new ReadOnlySequence<byte>([.. Utf8("a")]));
+        var reader = new SequenceTextReader(new ReadOnlySequence<byte>([0xEF, 0xBB, 0xBF, .. Utf8("a")]));
         var buffer = new char[4];
 
         reader.Read(buffer, 0, 4).ShouldBe(1);
         new string(buffer, 0, 1).ShouldBe("a");
+    }
+
+    [Fact]
+    public void AdvancesPastEmptySegments()
+    {
+        var reader = new SequenceTextReader(CreateSequence([], Utf8("a")));
+
+        reader.ReadToEnd().ShouldBe("a");
     }
 
     [Fact]
@@ -355,11 +375,12 @@ public partial class BufferApiTests
     {
         var buffer = new ArrayBufferWriter<byte>();
         buffer.Write("prefix:"u8.ToArray());
+        var person = new Person { Name = "John", Age = 30 };
 
-        YamlSerializer.Serialize(buffer, new Person { Name = "John", Age = 30 }, TypeInfo(x => x.Person));
+        YamlSerializer.Serialize(buffer, person, TypeInfo(x => x.Person));
 
-        var text = Encoding.UTF8.GetString(buffer.WrittenSpan);
-        text.ShouldStartWith("prefix:");
+        Encoding.UTF8.GetString(buffer.WrittenSpan)
+            .ShouldBe("prefix:" + YamlSerializer.Serialize(person, TypeInfo(x => x.Person)));
     }
 
     [Fact]
@@ -608,6 +629,8 @@ public partial class BufferApiTests
     [Fact]
     public async Task OptionsOverloadsRoundTripThroughStream()
     {
+        ReflectionOnlyTests.SkipWhenReflectionUnavailable();
+
         var person = new Person { Name = "John", Age = 30 };
 
         var expected = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(person, CamelCase));
@@ -632,6 +655,8 @@ public partial class BufferApiTests
     [Fact]
     public async Task OptionsAsyncSerializeRoundTripsThroughStream()
     {
+        ReflectionOnlyTests.SkipWhenReflectionUnavailable();
+
         var person = new Person { Name = "Jane", Age = 42 };
 
         using var output = new MemoryStream();
@@ -650,6 +675,8 @@ public partial class BufferApiTests
     [Fact]
     public void OptionsOverloadsRoundTripThroughBytes()
     {
+        ReflectionOnlyTests.SkipWhenReflectionUnavailable();
+
         var bytes = YamlSerializer.SerializeToUtf8Bytes(new Person { Name = "John", Age = 30 }, CamelCase);
 
         var fromMemory = YamlSerializer.Deserialize<Person>(bytes, CamelCase);
@@ -661,12 +688,22 @@ public partial class BufferApiTests
     [Fact]
     public void SerializeToUtf8BytesMatchesStringOverload()
     {
+        ReflectionOnlyTests.SkipWhenReflectionUnavailable();
+
         var person = new Person { Name = "John", Age = 30 };
         var expected = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(person, CamelCase));
 
         YamlSerializer.SerializeToUtf8Bytes(person, CamelCase).ShouldBe(expected);
+    }
+
+    [Fact]
+    public void SerializeToUtf8BytesWithJsonTypeInfoMatchesStringOverload()
+    {
+        var person = new Person { Name = "John", Age = 30 };
+        var expected = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(person, BufferJsonContext.Default.Person));
+
         YamlSerializer.SerializeToUtf8Bytes(person, BufferJsonContext.Default.Person).ShouldBe(
-            Encoding.UTF8.GetBytes(YamlSerializer.Serialize(person, BufferJsonContext.Default.Person)));
+            expected);
     }
 
     [Fact]
@@ -696,6 +733,8 @@ public partial class BufferApiTests
     [Fact]
     public void AsyncOptionsOverloadsHonorCancellation()
     {
+        ReflectionOnlyTests.SkipWhenReflectionUnavailable();
+
         using var output = new MemoryStream();
         Should.Throw<OperationCanceledException>(() =>
             YamlSerializer.SerializeAsync(output, new Person(), CamelCase, null, new CancellationToken(true)).GetAwaiter().GetResult());
@@ -733,29 +772,28 @@ public partial class BufferApiTests
     [MemberData(nameof(YamlCorpus))]
     public async Task ByteAndStreamAndStringPathsAgree(string yaml)
     {
-        var expected = YamlSerializer.Deserialize(yaml, TypeInfo(x => x.Person));
-        var expectedJson = expected is null ? "null" : JsonSerializer.Serialize(expected, BufferJsonContext.Default.Person);
+        var expected = YamlSerializer.Deserialize(yaml, TypeInfo(x => x.JsonElement));
+        var expectedJson = JsonSerializer.Serialize(expected, BufferJsonContext.Default.JsonElement);
 
-        var fromBytes = YamlSerializer.Deserialize(Utf8(yaml), TypeInfo(x => x.Person));
-        var fromBytesJson = fromBytes is null ? "null" : JsonSerializer.Serialize(fromBytes, BufferJsonContext.Default.Person);
+        var fromBytes = YamlSerializer.Deserialize(Utf8(yaml), TypeInfo(x => x.JsonElement));
+        var fromBytesJson = JsonSerializer.Serialize(fromBytes, BufferJsonContext.Default.JsonElement);
         fromBytesJson.ShouldBe(expectedJson, customMessage: yaml);
 
         using var stream = new MemoryStream(Utf8(yaml));
-        var fromStream = await YamlSerializer.DeserializeAsync(stream, TypeInfo(x => x.Person));
-        var fromStreamJson = fromStream is null ? "null" : JsonSerializer.Serialize(fromStream, BufferJsonContext.Default.Person);
+        var fromStream = await YamlSerializer.DeserializeAsync(stream, TypeInfo(x => x.JsonElement));
+        var fromStreamJson = JsonSerializer.Serialize(fromStream, BufferJsonContext.Default.JsonElement);
         fromStreamJson.ShouldBe(expectedJson, customMessage: yaml);
     }
 
     [Theory]
     [MemberData(nameof(YamlCorpus))]
-    public void SinkOutputMatchesStringOutput(string _)
+    public void SinkOutputMatchesStringOutput(string yaml)
     {
-        var person = new Person { Name = "John", Age = 30 };
-        var expected = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(person, TypeInfo(x => x.Person)));
+        var expected = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(yaml, TypeInfo(x => x.String)));
 
         var buffer = new ArrayBufferWriter<byte>();
 
-        YamlSerializer.Serialize(buffer, person, TypeInfo(x => x.Person));
+        YamlSerializer.Serialize(buffer, yaml, TypeInfo(x => x.String));
 
         buffer.WrittenSpan.ToArray().ShouldBe(expected);
     }

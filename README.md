@@ -344,24 +344,25 @@ based serializer with this library in reflection and source generated modes:
 dotnet run --project benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks -c Release -- --filter '*'
 ```
 
-Correctness and compatibility were prioritized over micro-optimization. The zero-copy conversion
-paths are in place: emit encodes straight into the caller's buffers (string, `Stream`,
-`IBufferWriter<byte>`), and deserialize decodes UTF-8 incrementally into characters as the parser
-pulls them (no whole-input UTF-16 string on any path). The one remaining known deficit is
+Correctness and compatibility were prioritized over micro-optimization. The `IBufferWriter<byte>`
+serialize overload emits UTF-8 directly into the caller's writer. String and `Stream` overloads
+stage the complete YAML document in pooled UTF-8 buffers before constructing the returned string
+or writing it to the stream. Deserialization decodes UTF-8 incrementally into characters as the
+parser pulls them (no whole-input UTF-16 string on any path). The one remaining known deficit is
 deserializing a single very large scalar (scanner-internal); a raw UTF-8 front-end for the
 scanner is recorded as future work in `docs/phase-7-completion-plan.md`.
 
 ### Recorded results
 
-BenchmarkDotNet `ShortRun`, linux-x64, .NET 11 (times relative to YamlDotNet reflection
-serialization = 1.00):
+BenchmarkDotNet `ShortRun`, linux-x64, .NET 11. Time and allocation ratios use the matching
+YamlDotNet reflection operation as the 1.00x baseline:
 
 | Scenario | Serialize time | Serialize alloc | Deserialize time | Deserialize alloc |
 |---|---|---|---|---|
-| Small config (6 properties) | 0.31x (contracts) | 0.35x | 0.65x | 0.84x |
-| Kubernetes manifest (10 containers) | 0.38x | 0.44x | 0.63x | 0.98x |
-| 1,000 item list | 0.36x | 0.40x | 0.66x | 0.95x |
-| 64 KB scalar document | 0.97x | 0.93x | 0.72x | 1.44x |
+| Small config (6 properties) | 0.30x (contracts) | 0.27x | 0.78x | 0.88x |
+| Kubernetes manifest (10 containers) | 0.41x | 0.45x | 0.74x | 1.06x |
+| 1,000 item list | 0.32x | 0.46x | 0.64x | 1.06x |
+| 64 KB scalar document | 0.93x | 0.92x | 0.65x | 1.44x |
 
 Reflection mode tracks the source generated mode closely (within ~5-10%). The token bridge is
 faster and allocates less than YamlDotNet's reflection based object engine for structured data.
@@ -374,10 +375,10 @@ is therefore only addressable by the UTF-8 native front-end work.
 
 | Operation | Sync | Async | Delta |
 |---|---|---|---|
-| Serialize small | 16.1 µs / 4.45 KB | 16.0 µs / 4.45 KB | parity |
-| Serialize 64 KB scalar | 3,168 µs / 194 KB | 3,076 µs / 194 KB | allocation parity (batched write in both) |
-| Deserialize small | 35.1 µs / 18.9 KB | 37.8 µs / 18.0 KB | ≈ equal, async slightly lighter |
-| Deserialize 64 KB scalar | 2,455 µs / 410 KB | 2,345 µs / 410 KB | parity (the async overload stages UTF-8 in pooled buffers and decodes incrementally) |
+| Serialize small | 17.4 µs / 4.98 KB | 18.0 µs / 4.98 KB | ≈ equal |
+| Serialize 64 KB scalar | 3,311 µs / 194.25 KB | 3,515 µs / 194.30 KB | allocation parity (batched write in both) |
+| Deserialize small | 38.4 µs / 19.64 KB | 44.5 µs / 18.63 KB | async slightly slower and lighter |
+| Deserialize 64 KB scalar | 2,274 µs / 410.76 KB | 2,482 µs / 409.78 KB | allocation parity (async stages UTF-8 in pooled buffers and decodes incrementally) |
 
 Guidance: serialize allocates identically for sync and async (the document is encoded into
 pooled UTF-8 buffers and written with a single call). Deserialize has allocation parity between
@@ -398,7 +399,7 @@ dotnet pack src/SVCSystems.Text.Json.Yaml -c Release
 Native AOT validation:
 
 ```sh
-dotnet publish tests/SVCSystems.Text.Json.Yaml.AotTests -c Release -r linux-x64
+dotnet publish tests/SVCSystems.Text.Json.Yaml.AotTests -c Release -r linux-x64 -o artifacts/aot-tests
 ./artifacts/aot-tests/SVCSystems.Text.Json.Yaml.AotTests
 ```
 

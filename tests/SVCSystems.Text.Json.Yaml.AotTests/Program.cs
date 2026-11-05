@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ExternalContracts;
@@ -85,7 +86,8 @@ public static class Program
         // generated metadata with reflection disabled.
         var sink = new ArrayBufferWriter<byte>();
         YamlSerializer.Serialize(sink, new AotModel { Name = "api", Replicas = 3, Level = LogLevel.High }, AppJsonContext.Default.AotModel);
-        Check(sink.WrittenSpan.SequenceEqual("name: api\nreplicas: 3\nlevel: High\n"u8), "serialize to IBufferWriter sink");
+        var sinkYaml = Encoding.UTF8.GetString(sink.WrittenSpan).ReplaceLineEndings("\n");
+        Check(sinkYaml == "name: api\nreplicas: 3\nlevel: High\n", "serialize to IBufferWriter sink");
 
         var sinkModel = YamlSerializer.Deserialize(sink.WrittenMemory, AppJsonContext.Default.AotModel);
         Check(sinkModel is { Name: "api", Replicas: 3, Level: LogLevel.High }, "deserialize from ReadOnlyMemory bytes");

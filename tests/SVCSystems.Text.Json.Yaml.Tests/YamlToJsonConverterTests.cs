@@ -169,6 +169,22 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void ReplayedNestedAnchorDoesNotReplaceALaterSourceDeclaration()
+    {
+        var json = ConvertToJson("""
+            root: &root
+              nested: &value old
+            latest: &value new
+            copy: *root
+            alias: *value
+            """);
+
+        json.ShouldContain("\"latest\":\"new\"");
+        json.ShouldContain("\"copy\":{\"nested\":\"old\"}");
+        json.ShouldContain("\"alias\":\"new\"");
+    }
+
+    [Fact]
     public void RejectsUndefinedAliases()
     {
         Should.Throw<YamlException>(() => ConvertToJson("copy: *missing"))
@@ -318,8 +334,11 @@ public partial class YamlToJsonConverterTests
     {
         // Core is the default schema.
         ConvertToJson("value: 0x1A").ShouldBe("{\"value\":26}");
-        ConvertToJson("value: -0x1A").ShouldBe("{\"value\":-26}");
         ConvertToJson("value: 0o17").ShouldBe("{\"value\":15}");
+        ConvertToJson("value: -0x1A").ShouldBe("{\"value\":\"-0x1A\"}");
+        JsonDocument.Parse(ConvertToJson("value: +0o17")).RootElement.GetProperty("value").GetString().ShouldBe("+0o17");
+        ConvertToJson("value: 0X1A").ShouldBe("{\"value\":\"0X1A\"}");
+        ConvertToJson("value: 0O17").ShouldBe("{\"value\":\"0O17\"}");
 
         // JSON schema leaves no implicit plain-string fallback. Values not matching its scalar
         // patterns are errors; JSON strings must be quoted or explicitly tagged.
@@ -370,6 +389,13 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void PreservesNegativeZeroWhenProjectingIntegerScalars()
+    {
+        ConvertToJson("value: -0").ShouldBe("{\"value\":-0}");
+        ConvertToJson("value: -00").ShouldBe("{\"value\":-0}");
+    }
+
+    [Fact]
     public void CoreSchemaResolvesVeryLargeHexIntegersExactly()
     {
         var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
@@ -379,12 +405,33 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void CoreSchemaResolvesLongRadixIntegersWithoutLosingPrecision()
+    {
+        var digits = new string('7', 4096);
+        var yamlOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Core };
+        var expected = System.Numerics.BigInteger.Pow(8, digits.Length) - 1;
+
+        ConvertToJson($"value: 0o{digits}", yamlOptions)
+            .ShouldBe($"{{\"value\":{expected.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}");
+    }
+
+    [Fact]
     public void BothSchemasRejectSpecialFloats()
     {
+        var jsonSchema = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
         foreach (var value in new[] { ".inf", "+.INF", "-.Inf", ".nan", "+.NaN", "-.NAN" })
         {
+            Should.Throw<YamlException>(() => ConvertToJson($"value: {value}", jsonSchema));
+        }
+
+        foreach (var value in new[] { ".inf", "+.INF", "-.Inf", ".nan", ".NaN", ".NAN" })
+        {
             Should.Throw<YamlException>(() => ConvertToJson($"value: {value}"));
-            Should.Throw<YamlException>(() => ConvertToJson($"'value': {value}", new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json }));
+        }
+
+        foreach (var value in new[] { "+.NaN", "-.NAN" })
+        {
+            JsonDocument.Parse(ConvertToJson($"value: {value}")).RootElement.GetProperty("value").GetString().ShouldBe(value);
         }
     }
 

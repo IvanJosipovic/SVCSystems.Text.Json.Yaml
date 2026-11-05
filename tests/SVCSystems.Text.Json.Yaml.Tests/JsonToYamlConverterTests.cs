@@ -120,6 +120,13 @@ public partial class JsonToYamlConverterTests
             .Message.ShouldContain("duplicate property name 'a'");
     }
 
+    [Fact]
+    public void RejectsNestedDuplicateJsonObjectProperties()
+    {
+        Should.Throw<JsonException>(() => JsonToYamlConverter.ConvertToString("""{"outer":{"a":1,"a":2}}"""u8))
+            .Message.ShouldContain("duplicate property name 'a'");
+    }
+
     [JsonSerializable(typeof(JsonElement))]
     internal sealed partial class JsonElementContext : JsonSerializerContext;
 }

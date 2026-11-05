@@ -151,6 +151,12 @@ public partial class YamlTestSuiteConformanceTests
                     $"'{testCase.Name}': the byte and string deserialization paths disagree (string error: {Describe(stringError)}, byte error: {Describe(byteError)})");
             }
 
+            if (stringError.GetType() != byteError.GetType())
+            {
+                throw new YamlException(
+                    $"'{testCase.Name}': the byte and string paths rejected with different exception types (string: {Describe(stringError)}, byte: {Describe(byteError)})");
+            }
+
             Assert.Skip($"Both paths reject this case ({stringError.GetType().Name}); covered by the main conformance theory.");
         }
 

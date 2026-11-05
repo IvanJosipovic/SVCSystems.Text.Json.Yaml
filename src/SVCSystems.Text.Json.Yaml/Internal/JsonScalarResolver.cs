@@ -95,8 +95,8 @@ internal static class JsonScalarResolver
             return true;
         }
 
-        return IsRadixInteger(value, "0x", "0X", IsHexDigit)
-            || IsRadixInteger(value, "0o", "0O", c => c is >= '0' and <= '7');
+        return IsRadixInteger(value, "0x", IsHexDigit)
+            || IsRadixInteger(value, "0o", c => c is >= '0' and <= '7');
     }
 
     public static bool IsFloatScalar(string? value, YamlScalarSchema schema)
@@ -114,8 +114,6 @@ internal static class JsonScalarResolver
     public static bool IsSpecialFloat(string? value)
     {
         return value is ".nan" or ".NaN" or ".NAN"
-            or "+.nan" or "+.NaN" or "+.NAN"
-            or "-.nan" or "-.NaN" or "-.NAN"
             or ".inf" or ".Inf" or ".INF"
             or "+.inf" or "+.Inf" or "+.INF"
             or "-.inf" or "-.Inf" or "-.INF";
@@ -153,24 +151,12 @@ internal static class JsonScalarResolver
 
         if (digits.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
         {
-            var number = new BigInteger(0);
-            foreach (var c in digits[2..])
-            {
-                number = number * 16 + (c is >= '0' and <= '9' ? c - '0' : char.ToUpperInvariant(c) - 'A' + 10);
-            }
-
-            return (sign * number).ToString(CultureInfo.InvariantCulture);
+            return (sign * ParseHexInteger(digits[2..])).ToString(CultureInfo.InvariantCulture);
         }
 
         if (digits.StartsWith("0o", StringComparison.OrdinalIgnoreCase))
         {
-            var number = new BigInteger(0);
-            foreach (var c in digits[2..])
-            {
-                number = number * 8 + c - '0';
-            }
-
-            return (sign * number).ToString(CultureInfo.InvariantCulture);
+            return (sign * ParseOctalInteger(digits[2..])).ToString(CultureInfo.InvariantCulture);
         }
 
         var decimalValue = BigInteger.Parse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
@@ -378,13 +364,12 @@ internal static class JsonScalarResolver
         return true;
     }
 
-    private static bool IsRadixInteger(string? value, string lowerPrefix, string upperPrefix, Func<char, bool> isDigit)
+    private static bool IsRadixInteger(string? value, string prefix, Func<char, bool> isDigit)
     {
         if (value is not { Length: > 2 }) return false;
-        var start = value[0] is '-' or '+' ? 1 : 0;
-        var span = value.AsSpan(start);
-        if (!span.StartsWith(lowerPrefix) && !span.StartsWith(upperPrefix)) return false;
-        var digits = span[2..];
+        var span = value.AsSpan();
+        if (!span.StartsWith(prefix, StringComparison.Ordinal)) return false;
+        var digits = span[prefix.Length..];
         if (digits.IsEmpty) return false;
         foreach (var c in digits)
         {
@@ -392,6 +377,58 @@ internal static class JsonScalarResolver
         }
         return true;
     }
+
+    private static BigInteger ParseHexInteger(ReadOnlySpan<char> digits)
+    {
+        // Hexadecimal is a power-of-two radix. Pack the nibbles directly into an unsigned
+        // little-endian byte buffer instead of repeatedly multiplying a growing BigInteger.
+        var bytes = new byte[(int)(((long)digits.Length + 1) / 2)];
+        var byteIndex = 0;
+
+        for (var index = digits.Length; index > 0;)
+        {
+            var low = HexDigitValue(digits[--index]);
+            var high = index > 0 ? HexDigitValue(digits[--index]) : 0;
+            bytes[byteIndex++] = (byte)((high << 4) | low);
+        }
+
+        return new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+    }
+
+    private static BigInteger ParseOctalInteger(ReadOnlySpan<char> digits)
+    {
+        // Octal digits contain exactly three bits. Pack them directly into an unsigned
+        // little-endian byte buffer so parsing remains linear in the input length.
+        var byteLength = checked((int)(((long)digits.Length * 3 + 7) / 8));
+        var bytes = new byte[byteLength];
+        var byteIndex = 0;
+        var accumulator = 0;
+        var bitsInAccumulator = 0;
+
+        for (var index = digits.Length - 1; index >= 0; index--)
+        {
+            accumulator |= (digits[index] - '0') << bitsInAccumulator;
+            bitsInAccumulator += 3;
+
+            if (bitsInAccumulator >= 8)
+            {
+                bytes[byteIndex++] = (byte)accumulator;
+                accumulator >>= 8;
+                bitsInAccumulator -= 8;
+            }
+        }
+
+        if (bitsInAccumulator > 0)
+        {
+            bytes[byteIndex] = (byte)accumulator;
+        }
+
+        return new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+    }
+
+    private static int HexDigitValue(char value) => value is >= '0' and <= '9'
+        ? value - '0'
+        : (value | 0x20) - 'a' + 10;
 
     private static int FindExponent(string value, int start)
     {

@@ -119,7 +119,21 @@ internal sealed class SequenceTextReader : TextReader
                 break;
             }
 
-            var span = _sequence.IsSingleSegment ? _sequence.FirstSpan : _sequence.First.Span;
+            if (!_sequence.IsSingleSegment && _sequence.First.IsEmpty)
+            {
+                // Advance by segment position, not byte length: slicing by the empty segment's
+                // zero length would leave the sequence unchanged and spin forever.
+                var nextSegment = _sequence.Start;
+                if (!_sequence.TryGet(ref nextSegment, out _, advance: true))
+                {
+                    throw new InvalidOperationException("The sequence reported non-empty input without a readable segment.");
+                }
+
+                _sequence = _sequence.Slice(nextSegment);
+                continue;
+            }
+
+            var span = _sequence.FirstSpan;
 
             _decoder.Convert(span, _buffer.AsSpan(_end), flush: false, out var bytesUsed, out var charsUsed, out _);
 

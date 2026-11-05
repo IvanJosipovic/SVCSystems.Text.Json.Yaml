@@ -295,7 +295,9 @@ internal static class YamlToJsonConverter
                 writer.WriteBooleanValue(value);
                 return;
             case JsonScalarKind.Integer:
-                writer.WriteRawValue(JsonScalarResolver.NormalizeInteger(scalar.Value), skipInputValidation: false);
+                var normalized = JsonScalarResolver.NormalizeInteger(scalar.Value);
+                var jsonInteger = scalar.Value.StartsWith('-') && normalized == "0" ? "-0" : normalized;
+                writer.WriteRawValue(jsonInteger, skipInputValidation: false);
                 return;
             case JsonScalarKind.Float:
                 if (JsonScalarResolver.IsSpecialFloat(scalar.Value)) throw UnsupportedSpecialFloat(scalar);

@@ -18,12 +18,16 @@ public class BufferSinkBenchmarks
     private readonly LargeScalarDocument _largeModel = Fixtures.CreateLargeScalar(64);
     private byte[] _smallYaml = [];
     private byte[] _largeYaml = [];
+    private string _smallYamlText = "";
+    private string _largeYamlText = "";
 
     [GlobalSetup]
     public void Setup()
     {
         _smallYaml = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(_smallModel, BenchmarkJsonContext.Default.SmallConfig));
         _largeYaml = Encoding.UTF8.GetBytes(YamlSerializer.Serialize(_largeModel, BenchmarkJsonContext.Default.LargeScalarDocument));
+        _smallYamlText = Encoding.UTF8.GetString(_smallYaml);
+        _largeYamlText = Encoding.UTF8.GetString(_largeYaml);
     }
 
     // --- Serialize to IBufferWriter<byte> ---
@@ -66,9 +70,9 @@ public class BufferSinkBenchmarks
 
     [Benchmark]
     public SmallConfig? Deserialize_Small_String() =>
-        YamlSerializer.Deserialize(Encoding.UTF8.GetString(_smallYaml), BenchmarkJsonContext.Default.SmallConfig);
+        YamlSerializer.Deserialize(_smallYamlText, BenchmarkJsonContext.Default.SmallConfig);
 
     [Benchmark]
     public LargeScalarDocument? Deserialize_Large_String() =>
-        YamlSerializer.Deserialize(Encoding.UTF8.GetString(_largeYaml), BenchmarkJsonContext.Default.LargeScalarDocument);
+        YamlSerializer.Deserialize(_largeYamlText, BenchmarkJsonContext.Default.LargeScalarDocument);
 }

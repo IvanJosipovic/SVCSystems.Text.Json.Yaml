@@ -104,6 +104,11 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
     private void WriteCore(ReadOnlySpan<char> value)
     {
+        if (value.IsEmpty)
+        {
+            return;
+        }
+
         if (_pendingHighSurrogate != '\0')
         {
             if (value.Length > 0 && char.IsLowSurrogate(value[0]))

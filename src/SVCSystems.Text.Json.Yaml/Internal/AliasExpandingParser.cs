@@ -45,7 +45,7 @@ internal sealed class AliasExpandingParser(IParser inner, long maxExpansionEvent
 
     public bool MoveNext()
     {
-        var evt = ReadEvent();
+        var (evt, isReplay) = ReadEvent();
 
         // Expand alias chains until a non-alias event is reached.
         while (evt is AnchorAlias alias)
@@ -75,7 +75,7 @@ internal sealed class AliasExpandingParser(IParser inner, long maxExpansionEvent
                 _pending.Enqueue(buffered);
             }
 
-            evt = ReadEvent();
+            (evt, isReplay) = ReadEvent();
         }
 
         if (evt is null)
@@ -84,11 +84,11 @@ internal sealed class AliasExpandingParser(IParser inner, long maxExpansionEvent
             return false;
         }
 
-        Current = Record(evt);
+        Current = Record(evt, isReplay);
         return true;
     }
 
-    private ParsingEvent? ReadEvent()
+    private (ParsingEvent? Event, bool IsReplay) ReadEvent()
     {
         if (_pending.Count > 0)
         {
@@ -100,15 +100,18 @@ internal sealed class AliasExpandingParser(IParser inner, long maxExpansionEvent
                     $"The YAML document exceeds the alias expansion limit of {maxExpansionEvents} events. Adjust {nameof(YamlSerializerOptions)}.{nameof(YamlSerializerOptions.MaxAliasExpansionEvents)} or reduce alias usage.");
             }
 
-            return _pending.Dequeue();
+            return (_pending.Dequeue(), true);
         }
 
-        return inner.MoveNext() ? inner.Current : null;
+        return (inner.MoveNext() ? inner.Current : null, false);
     }
 
-    private ParsingEvent Record(ParsingEvent evt)
+    private ParsingEvent Record(ParsingEvent evt, bool isReplay)
     {
-        AnchorName? anchor = evt switch
+        // Replayed anchor events are part of the expanded output, but are not new source
+        // declarations. Registering them could let an older nested anchor in a replayed
+        // subtree replace a newer declaration encountered later in the source document.
+        AnchorName? anchor = isReplay ? null : evt switch
         {
             Scalar s => s.Anchor.IsEmpty ? (AnchorName?)null : s.Anchor,
             SequenceStart sequence => sequence.Anchor.IsEmpty ? (AnchorName?)null : sequence.Anchor,
@@ -132,7 +135,7 @@ internal sealed class AliasExpandingParser(IParser inner, long maxExpansionEvent
 
         switch (evt)
         {
-            case Scalar scalar when !scalar.Anchor.IsEmpty:
+            case Scalar scalar when !isReplay && !scalar.Anchor.IsEmpty:
                 // A scalar is a single event; its buffer is complete immediately.
                 Close(scalar.Anchor);
                 break;

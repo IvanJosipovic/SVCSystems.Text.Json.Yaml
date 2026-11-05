@@ -43,9 +43,9 @@ public sealed class YamlSerializerOptions
     /// <summary>
     /// Gets or sets the number of spaces used to indent nested block collections, mirroring
     /// <see cref="System.Text.Json.JsonSerializerOptions.IndentSize"/>. Valid values are 1 to 9,
-    /// matching the YAML specification's maximum block indentation. There is intentionally no
-    /// <c>IndentCharacter</c> option: the YAML specification forbids tab characters for
-    /// indentation, so indentation is always spaces.
+    /// a limit imposed by this library. YAML 1.2.2's single-digit indentation indicator grammar
+    /// does not cap block collection indentation. There is intentionally no <c>IndentCharacter</c>
+    /// option: YAML forbids tab characters for indentation, so indentation is always spaces.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is not between 1 and 9.</exception>
     public int IndentSize
