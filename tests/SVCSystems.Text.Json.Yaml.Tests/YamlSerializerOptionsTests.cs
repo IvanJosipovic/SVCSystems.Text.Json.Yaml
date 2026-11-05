@@ -121,7 +121,7 @@ public partial class YamlSerializerOptionsTests
     [Fact]
     public void IndentationChangesOnlyFormatting()
     {
-        var yamlOptions = new YamlSerializerOptions { Indentation = 4 };
+        var yamlOptions = new YamlSerializerOptions { IndentSize = 4 };
         var model = new Dictionary<string, Dictionary<string, int>> { ["outer"] = new() { ["inner"] = 1 } };
 
         var yaml = YamlSerializer.Serialize(model, OptionsJsonContext.Default.DictionaryStringDictionaryStringInt32, yamlOptions);
@@ -174,7 +174,7 @@ public partial class YamlSerializerOptionsTests
 
         var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
         var before = (jsonOptions.PropertyNamingPolicy, jsonOptions.DefaultIgnoreCondition, jsonOptions.ReadCommentHandling);
-        var yamlOptions = new YamlSerializerOptions { Indentation = 8, UseFlowStyle = true, EmitDocumentStart = true };
+        var yamlOptions = new YamlSerializerOptions { IndentSize = 8, UseFlowStyle = true, EmitDocumentStart = true };
 
         YamlSerializer.Serialize(new NamedModel { FullName = "John" }, jsonOptions, yamlOptions);
 
@@ -184,10 +184,10 @@ public partial class YamlSerializerOptionsTests
     [Fact]
     public void InvalidIndentationIsRejected()
     {
-        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { Indentation = 0 })
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { IndentSize = 0 })
             .ParamName.ShouldBe("value");
-        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { Indentation = 10 });
-        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { Indentation = -1 });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { IndentSize = 10 });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { IndentSize = -1 });
     }
 
     [Fact]
@@ -200,10 +200,9 @@ public partial class YamlSerializerOptionsTests
     public void CoreScalarSchemaIsTheDefault()
     {
         new YamlSerializerOptions().ScalarSchema.ShouldBe(YamlScalarSchema.Core);
-        new YamlSerializerOptions().Indentation.ShouldBe(2);
+        new YamlSerializerOptions().IndentSize.ShouldBe(2);
         new YamlSerializerOptions().EmitDocumentStart.ShouldBeFalse();
         new YamlSerializerOptions().UseFlowStyle.ShouldBeFalse();
-        new YamlSerializerOptions().AllowDuplicateKeys.ShouldBeFalse();
         new YamlSerializerOptions().Width.ShouldBe(80);
         new YamlSerializerOptions().MaxSimpleKeyLength.ShouldBe(128);
         new YamlSerializerOptions().IndentedSequences.ShouldBeFalse();
@@ -215,8 +214,12 @@ public partial class YamlSerializerOptionsTests
     {
         Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { Width = 0 });
         Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { MaxSimpleKeyLength = 0 });
-        Should.Throw<ArgumentException>(() => new YamlSerializerOptions { NewLine = "" });
-        Should.Throw<ArgumentException>(() => new YamlSerializerOptions { NewLine = null! });
+        Should.Throw<ArgumentNullException>(() => new YamlSerializerOptions { NewLine = null! });
+        // System.Text.Json parity: only "\n" and "\r\n" are valid newline sequences.
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { NewLine = "" });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { NewLine = "\r" });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { NewLine = "\n\r" });
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { NewLine = "\r\n\r\n" });
         Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { StringStyle = (YamlStringStyle)42 });
     }
 
@@ -236,6 +239,13 @@ public partial class YamlSerializerOptionsTests
 
         result.ShouldNotBeNull();
         result["text"].ShouldBe("aaaaaaaaaa bbbbbbbbbb cccccccccc");
+    }
+
+    [Fact]
+    public void NewLineDefaultsToEnvironmentNewLine()
+    {
+        // System.Text.Json parity: JsonWriterOptions.NewLine defaults to Environment.NewLine.
+        new YamlSerializerOptions().NewLine.ShouldBe(Environment.NewLine);
     }
 
     [Fact]
@@ -319,16 +329,5 @@ public partial class YamlSerializerOptionsTests
 
         result.ShouldNotBeNull();
         result["key"].ShouldBe("hello");
-    }
-
-    [Fact]
-    public void MaxInputLengthIsEnforcedOnTheStreamOverload()
-    {
-        var yamlOptions = new YamlSerializerOptions { MaxInputLength = 10 };
-
-        using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("Name: a-value-longer-than-ten\nAge: 1\n"));
-
-        Should.Throw<YamlDotNet.Core.YamlException>(() => YamlSerializer.Deserialize(stream, OptionsJsonContext.Default.NamedModel, yamlOptions))
-            .Message.ShouldContain("maximum input length");
     }
 }

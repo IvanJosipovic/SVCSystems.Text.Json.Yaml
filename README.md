@@ -74,6 +74,15 @@ var yaml = YamlSerializer.Serialize(person, jsonOptions: jsonOptions);
 var roundTrip = YamlSerializer.Deserialize<Person>(yaml, jsonOptions);
 ```
 
+The options-based overloads mirror `System.Text.Json`'s surface, including streams, bytes and
+`SerializeToUtf8Bytes` (`SerializeToUtf8Bytes<T>(T, JsonSerializerOptions?, YamlSerializerOptions?)`,
+`Serialize(Stream, T, JsonSerializerOptions?, YamlSerializerOptions?)`,
+`SerializeAsync(Stream, T, ...)`, `Deserialize<T>(Stream, JsonSerializerOptions?, ...)`,
+`DeserializeAsync<T>(Stream, ...)`,
+`Deserialize<T>(ReadOnlyMemory<byte>, JsonSerializerOptions?, ...)`). They are annotated with
+`RequiresUnreferencedCode`/`RequiresDynamicCode` exactly like the corresponding
+`System.Text.Json` overloads.
+
 `WriteIndented` is a JSON setting and is not reinterpreted as YAML indentation. YAML indentation is
 owned by `YamlSerializerOptions`.
 
@@ -84,21 +93,13 @@ owned by `YamlSerializerOptions`.
 ```csharp
 public sealed class YamlSerializerOptions
 {
-    public int Indentation { get; set; } = 2;          // 1..9 spaces for nested block collections
+    public int IndentSize { get; set; } = 2;          // 1..9 spaces for nested block collections
     public bool EmitDocumentStart { get; set; }        // emit an explicit '---' marker
     public bool UseFlowStyle { get; set; }             // {a: 1} and [1, 2] instead of block style
     public YamlScalarSchema ScalarSchema { get; set; } = YamlScalarSchema.Core; // or Json
-    public bool AllowDuplicateKeys { get; set; }       // false: reject, true: last value wins
-    public bool AllowMergeKeys { get; set; } = true;   // apply '<<' merge keys
-    public SpecialFloatBehavior SpecialFloats { get; set; } // Reject (default) or String
-    public UnknownTagBehavior UnknownTags { get; set; }     // Reject (default) or Ignore
-    public bool AllowBinaryTag { get; set; }           // accept '!!binary' as a base64 string
-    public bool AllowTimestampTag { get; set; }        // accept '!!timestamp' as a string
     public int MaxDepth { get; set; } = 64;            // nesting limit
-    public int MaxInputLength { get; set; }            // 0: unlimited; enforced on string and stream inputs
-    public int MaxScalarLength { get; set; }           // 0: unlimited
+    public int MaxScalarLength { get; set; }           // post-scan acceptance limit; 0: unlimited
     public int MaxAliasExpansionEvents { get; set; } = 1_000_000;
-    public int MaxDocuments { get; set; } = 16;        // multi document APIs
     public int Width { get; set; } = 80;               // emitter folding width
     public int MaxSimpleKeyLength { get; set; } = 128; // longer keys become explicit '? key' entries
     public string NewLine { get; set; } = Environment.NewLine;
@@ -110,7 +111,7 @@ public sealed class YamlSerializerOptions
 ```csharp
 var yamlOptions = new YamlSerializerOptions
 {
-    Indentation = 4,
+    IndentSize = 4,
     EmitDocumentStart = true,
 };
 
@@ -125,8 +126,8 @@ var yaml = YamlSerializer.Serialize(person, yamlOptions: yamlOptions);
 | Custom converters and factories | `JsonSerializerOptions` |
 | Null handling, number handling, reference handling | `JsonSerializerOptions` |
 | Polymorphism, required members, extension data | `JsonSerializerOptions` |
-| Indentation, document markers, flow style | `YamlSerializerOptions` |
-| Scalar resolution schema, duplicate keys | `YamlSerializerOptions` |
+| IndentSize, document markers, flow style | `YamlSerializerOptions` |
+| Scalar resolution schema | `YamlSerializerOptions` |
 
 YAML options never mutate or override the supplied `JsonSerializerOptions`, and no JSON setting is
 duplicated in `YamlSerializerOptions`.
@@ -204,27 +205,32 @@ proves no reflection fallback is used:
 
 ## YAML scalar handling
 
-The default `YamlScalarSchema.Core` implements the YAML 1.2 core schema (section 10.3 of the
-specification):
+`YamlScalarSchema.Core` is the default and implements YAML 1.2.2 Core scalar resolution. Set
+`ScalarSchema = YamlScalarSchema.Json` for the YAML 1.2.2 JSON schema (not JSON syntax; YAML
+collections and syntax remain available). Its implicit resolution table has no plain-string
+fallback: unmatched plain scalars are errors and strings must be quoted or tagged `!!str`.
 
-| YAML input | Resolves to |
-|---|---|
-| `true`, `True`, `false` | boolean |
-| `null`, `Null`, `NULL`, `~`, empty | null |
-| `42`, `-7`, `+42`, `007` | integer (leading zeros are decimal) |
-| `0x1A`, `0o17` | integer (core schema; pass `YamlScalarSchema.Json` to keep them strings) |
-| `1.25`, `1.20`, `1e5`, `.5`, `5.` | number |
-| `"1.20"`, `'true'`, `"null"` | string (quoted scalars are always strings) |
-| `yes`, `no`, `on`, `off`, `y` | string (YAML 1.1 booleans are not core-schema booleans) |
-| `2026-01-01` | string (timestamps have no JSON equivalent) |
-| `.inf`, `-.inf`, `.nan` | rejected by default (no JSON number representation); set `SpecialFloats = String` to keep the text as a string |
+| YAML input | Core | Json |
+|---|---|---|
+| `true`, `True`, `false` | boolean | lowercase `true`/`false` are boolean; other forms error |
+| `null`, `Null`, `NULL`, `~`, empty | null | lowercase `null` is null; other forms error |
+| `42`, `-7`, `+42`, `007` | integer (leading zeros are decimal) | JSON-form integers; `+42` and `007` error |
+| `0x1A`, `0o17` | integer | error |
+| `1.25`, `1.20`, `1e5`, `5.`, `.5` | number | `1.25`, `1.20`, `1e5`, and `5.` are floats; `.5` errors |
+| `"1.20"`, `'true'`, `"null"` | string | string |
+| `yes`, `no`, `on`, `off`, `y`, `2026-01-01` | string | error unless quoted or tagged `!!str` |
+| `.inf`, `-.inf`, `.nan` | rejected (no JSON number representation) | error (no matching JSON-schema rule) |
 
-All numeric parsing is culture invariant. Integers that exceed 64 bits keep their exact value.
+Numeric tokens are normalized to valid JSON number syntax without floating-point rounding; integers
+retain arbitrary precision. Explicit standard tags validate the scalar against the selected schema,
+regardless of quoting style. Under the Json schema, output strings (including object keys) are
+quoted so they remain valid strings when read with that schema.
 
 ### Scalar preservation
 
-Serialization quotes strings that a YAML parser could misread as numbers, booleans or null, so
-JSON string values survive a round trip exactly:
+With the default Core schema, serialization quotes strings that could be resolved as numbers,
+booleans or null. Under the Json schema, every emitted string key and value is quoted because plain
+scalars have no implicit string fallback. JSON string values therefore survive round trips exactly:
 
 ```csharp
 var json = """{"version":"1.20","enabled":"true","count":3}""";
@@ -237,27 +243,32 @@ var yaml = YamlSerializer.Serialize(JsonSerializer.Deserialize<JsonElement>(json
 ## Supported YAML subset
 
 Supported: block and flow mappings and sequences, plain/quoted/block scalars, comments (ignored),
-explicit keys (`? key : value`), anchors and aliases (expanded, with an expansion budget against
-"billion laughs"), merge keys (`<<`, spec precedence), explicit document start (`---`), multiple
-documents (via the dedicated APIs), the standard YAML tags (`!!str`, `!!int`, `!!float`, `!!bool`,
-`!!null`, and optionally `!!binary`/`!!timestamp`), and configurable nesting depth.
+explicit keys (`? key : value`), acyclic anchors and aliases (expanded, with an expansion budget
+against "billion laughs"), explicit document start (`---`), multiple documents (via the dedicated
+APIs), and the JSON-representable standard tags `!!str`, `!!null`, `!!bool`, `!!int`, `!!float`,
+`!!seq`, and `!!map`.
 
 The default `YamlScalarSchema.Core` follows the YAML 1.2 core schema; see
 [docs/yaml-1.2-compat-plan.md](docs/yaml-1.2-compat-plan.md) for the measured conformance against
 the official yaml-test-suite.
 
-Explicitly rejected with a descriptive error (including line/column where possible), unless the
-corresponding policy is enabled:
+Explicitly rejected with a descriptive error (including line/column where possible):
 
 - Complex mapping keys (sequences/mappings used as keys)
-- Custom and non-standard tags (for example `!MyType`), unless `UnknownTags = Ignore`
-- `!!binary`/`!!timestamp`, unless `AllowBinaryTag`/`AllowTimestampTag` is enabled
-- Special floats `.inf`/`.nan`, unless `SpecialFloats = String`
+- Duplicate YAML mapping keys, including keys that differ textually but have the same YAML tag and canonical value
+- Scalar keys that collide after projection to JSON property names; duplicate JSON object property names are also rejected during serialization
+- Custom tags and tags without a JSON mapping, including `!!binary`, `!!timestamp`, `!!set`, `!!omap`, `!!pairs`, and `!!merge`
+- YAML 1.1 merge-key behavior. Under Core, plain `<<` is an ordinary string key; quoted or `!!str`-tagged `<<` is an ordinary string key under either schema. `!!merge` is rejected.
+- Core-schema special floats `.inf`/`.nan` (no JSON number representation)
+- Cyclic aliases (JSON has no cyclic graph representation)
 - Multiple documents in a single `Deserialize` call (use `DeserializeFirstDocument` or
   `DeserializeDocuments`)
-- Duplicate mapping keys, unless `AllowDuplicateKeys` is enabled (then the last value wins)
-- Merge keys, unless `AllowMergeKeys` (enabled by default)
-- Limits: `MaxDepth` (64), optional `MaxInputLength`/`MaxScalarLength`, alias expansion budget
+- Version directives other than YAML 1.2
+- Limits: `MaxDepth` (64), optional post-scan `MaxScalarLength`, and per-document alias expansion budget
+
+There is no document-count or input-byte cap. Applications handling untrusted input should bound
+the input stream at the hosting layer; `MaxScalarLength` is checked after YamlDotNet has scanned and
+materialized a scalar and is not a peak-memory limit.
 
 ## Multi document streams
 
@@ -294,6 +305,19 @@ using var output = File.Create("out.yaml");
 await YamlSerializer.SerializeAsync(output, config, ConfigJsonContext.Default.Config, cancellationToken: ct);
 ```
 
+UTF-8 bytes and `IBufferWriter<byte>` sinks are also supported, mirroring
+`System.Text.Json`'s API shape. Deserialization from bytes decodes incrementally (no
+whole-input UTF-16 string), skips a leading UTF-8 byte order mark, and rejects malformed UTF-8:
+
+```csharp
+IBufferWriter<byte> buffer = ...;
+YamlSerializer.Serialize(buffer, config, ConfigJsonContext.Default.Config);
+
+byte[] yamlBytes = Encoding.UTF8.GetBytes(yamlText);
+var config = YamlSerializer.Deserialize(yamlBytes, ConfigJsonContext.Default.Config);
+var config2 = await YamlSerializer.DeserializeAsync(yamlBytes, ConfigJsonContext.Default.Config, cancellationToken: ct);
+```
+
 ## Known limitations
 
 - Comments and YAML formatting (quoting styles, indentation, anchors) are not preserved on round
@@ -320,8 +344,12 @@ based serializer with this library in reflection and source generated modes:
 dotnet run --project benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks -c Release -- --filter '*'
 ```
 
-Correctness and compatibility were prioritized over micro-optimization; streaming and zero-copy
-conversion paths are future work.
+Correctness and compatibility were prioritized over micro-optimization. The zero-copy conversion
+paths are in place: emit encodes straight into the caller's buffers (string, `Stream`,
+`IBufferWriter<byte>`), and deserialize decodes UTF-8 incrementally into characters as the parser
+pulls them (no whole-input UTF-16 string on any path). The one remaining known deficit is
+deserializing a single very large scalar (scanner-internal); a raw UTF-8 front-end for the
+scanner is recorded as future work in `docs/phase-7-completion-plan.md`.
 
 ### Recorded results
 
@@ -346,16 +374,17 @@ is therefore only addressable by the UTF-8 native front-end work.
 
 | Operation | Sync | Async | Delta |
 |---|---|---|---|
-| Serialize small | 15.7 µs / 6.6 KB | 17.9 µs / 6.6 KB | ~+10% time (async state machine) |
-| Serialize 64 KB scalar | 2,768 µs / 199 KB | 2,714 µs / 199 KB | allocation parity (batched write in both) |
-| Deserialize small | 38.8 µs / 18.9 KB | 33.5 µs / 16.2 KB | ≈ equal, async slightly lighter |
-| Deserialize 64 KB scalar | 2,378 µs / 410 KB | 2,801 µs / 536 KB | async +30% allocations (whole input is buffered and decoded) |
+| Serialize small | 16.1 µs / 4.45 KB | 16.0 µs / 4.45 KB | parity |
+| Serialize 64 KB scalar | 3,168 µs / 194 KB | 3,076 µs / 194 KB | allocation parity (batched write in both) |
+| Deserialize small | 35.1 µs / 18.9 KB | 37.8 µs / 18.0 KB | ≈ equal, async slightly lighter |
+| Deserialize 64 KB scalar | 2,455 µs / 410 KB | 2,345 µs / 410 KB | parity (the async overload stages UTF-8 in pooled buffers and decodes incrementally) |
 
 Guidance: serialize allocates identically for sync and async (the document is encoded into
-pooled UTF-8 buffers and written with a single call). Deserialize differs: the sync overload
-reads via `StreamReader` in constant extra memory, while the async overload buffers the whole
-input and decodes it to a string before parsing — prefer the sync overload for large inputs
-unless cancellation during the read is needed.
+pooled UTF-8 buffers and written with a single call). Deserialize has allocation parity between
+sync and async: both decode incrementally and neither materializes a whole-input UTF-16 string;
+the async overload additionally stages the UTF-8 input (the YAML scanner reads it more than
+once), keeping its allocation profile proportional to input size. Prefer sync for
+memory-constrained large payloads; prefer async when cancellation during the read matters.
 
 ## Building from source
 

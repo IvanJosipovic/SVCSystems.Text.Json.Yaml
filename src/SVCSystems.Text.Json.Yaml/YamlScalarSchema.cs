@@ -9,59 +9,26 @@ public enum YamlScalarSchema
     /// The YAML 1.2 core schema (section 10.3 of the specification). This is the default.
     /// <para>
     /// Unquoted scalars resolve to <c>null</c> (empty, <c>null</c>/<c>Null</c>/<c>NULL</c>/<c>~</c>),
-    /// booleans (<c>true</c>/<c>false</c> in any capitalization), integers (decimal,
+    /// booleans (<c>true</c>/<c>True</c>/<c>TRUE</c> and corresponding false forms), integers (decimal,
     /// hexadecimal <c>0x1A</c>, octal <c>0o17</c>) and floats (including forms such as
     /// <c>.5</c> and <c>1.</c>). Timestamps and other non-number forms remain strings. Quoted
-    /// scalars are always strings. All numeric parsing is culture invariant.
+    /// scalars are strings unless an explicit standard tag specifies another type. Numeric parsing
+    /// is culture invariant.
     /// </para>
     /// </summary>
     Core = 0,
 
     /// <summary>
-    /// A JSON restricted resolution: the core schema limited to JSON number forms.
+    /// The YAML 1.2.2 JSON schema. Plain scalars resolve only from the lowercase JSON literals
+    /// (<c>null</c>, <c>true</c>, <c>false</c>) and its integer/floating-point patterns; a plain
+    /// scalar that matches none of these patterns is an error, not an implicit string.
     /// <para>
-    /// Hexadecimal (<c>0x1A</c>) and octal (<c>0o17</c>) integers remain strings because they
-    /// are not valid JSON numbers. Everything else resolves like <see cref="Core"/>.
+    /// For example, <c>True</c>, <c>~</c>, <c>+42</c>, <c>007</c>, <c>0x1A</c>, and <c>.5</c>
+    /// are errors unless quoted or tagged <c>!!str</c>; <c>5.</c> resolves as a float. Quoted
+    /// scalars are strings unless an explicit standard tag specifies another type.
     /// </para>
     /// </summary>
     Json = 1,
-}
-
-/// <summary>
-/// Defines how YAML special floats (<c>.inf</c>, <c>-.inf</c>, <c>.nan</c>) are handled during
-/// deserialization. The JSON data model has no representation for these values.
-/// </summary>
-public enum SpecialFloatBehavior
-{
-    /// <summary>
-    /// Reject special floats with a <see cref="YamlDotNet.Core.YamlException"/> (the default).
-    /// </summary>
-    Reject = 0,
-
-    /// <summary>
-    /// Resolve special floats to their source text as strings (<c>".inf"</c>, <c>"-.inf"</c>,
-    /// <c>".nan"</c>). This is lossless in the sense that the text is preserved, but the value
-    /// becomes a string in the JSON data model.
-    /// </summary>
-    String = 1,
-}
-
-/// <summary>
-/// Defines how unknown (non standard) YAML tags are handled during deserialization.
-/// </summary>
-public enum UnknownTagBehavior
-{
-    /// <summary>
-    /// Reject scalars and collections carrying tags other than the standard YAML tags with a
-    /// <see cref="YamlDotNet.Core.YamlException"/> (the default).
-    /// </summary>
-    Reject = 0,
-
-    /// <summary>
-    /// Ignore unrecognized tags and resolve the node as if it were untagged. Tags never cause
-    /// .NET type construction regardless of this setting.
-    /// </summary>
-    Ignore = 1,
 }
 
 /// <summary>

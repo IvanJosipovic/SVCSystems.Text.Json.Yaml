@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Buffers;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using ExternalContracts;
 using SVCSystems.Text.Json.Yaml;
@@ -50,7 +51,7 @@ public static class Program
         var formatted = YamlSerializer.Serialize(
             new Dictionary<string, int> { ["count"] = 42 },
             AppJsonContext.Default.DictionaryStringInt32,
-            new YamlSerializerOptions { Indentation = 4, EmitDocumentStart = true });
+            new YamlSerializerOptions { IndentSize = 4, EmitDocumentStart = true });
         Check(formatted.ReplaceLineEndings() == "---" + Environment.NewLine + "count: 42" + Environment.NewLine, "yaml formatting options");
 
         // Scalar preservation.
@@ -66,7 +67,73 @@ public static class Program
             && roundTripped.GetProperty("count").ValueKind == JsonValueKind.Number,
             "scalar round trip");
 
+        var jsonSchemaOptions = new YamlSerializerOptions { ScalarSchema = YamlScalarSchema.Json };
+        var jsonSchemaYaml = YamlSerializer.Serialize(
+            JsonSerializer.Deserialize("""{"value":"text","enabled":true}""", AppJsonContext.Default.JsonElement),
+            AppJsonContext.Default.JsonElement,
+            jsonSchemaOptions);
+        var jsonSchemaRoundTripped = YamlSerializer.Deserialize(
+            jsonSchemaYaml,
+            AppJsonContext.Default.JsonElement,
+            jsonSchemaOptions);
+        Check(
+            jsonSchemaRoundTripped.GetProperty("value").GetString() == "text"
+            && jsonSchemaRoundTripped.GetProperty("enabled").GetBoolean(),
+            "YAML JSON schema round trip with generated metadata");
+
+        // Phase 7 completion: IBufferWriter sinks and UTF-8 byte deserialization, all through
+        // generated metadata with reflection disabled.
+        var sink = new ArrayBufferWriter<byte>();
+        YamlSerializer.Serialize(sink, new AotModel { Name = "api", Replicas = 3, Level = LogLevel.High }, AppJsonContext.Default.AotModel);
+        Check(sink.WrittenSpan.SequenceEqual("name: api\nreplicas: 3\nlevel: High\n"u8), "serialize to IBufferWriter sink");
+
+        var sinkModel = YamlSerializer.Deserialize(sink.WrittenMemory, AppJsonContext.Default.AotModel);
+        Check(sinkModel is { Name: "api", Replicas: 3, Level: LogLevel.High }, "deserialize from ReadOnlyMemory bytes");
+
+        ReadOnlySequence<byte> segmented = SplitSegments(sink.WrittenSpan.ToArray(), 7);
+        var segmentedModel = YamlSerializer.Deserialize(segmented, AppJsonContext.Default.AotModel);
+        Check(segmentedModel is { Name: "api", Replicas: 3, Level: LogLevel.High }, "deserialize from segmented ReadOnlySequence bytes");
+
+        var sinkBytes = new ArrayBufferWriter<byte>();
+        YamlSerializer.Serialize(sinkBytes, new AotModel { Name = "ä", Replicas = 5, Level = LogLevel.Low }, AppJsonContext.Default.AotModel);
+        var unicodeModel = YamlSerializer.Deserialize(sinkBytes.WrittenMemory, AppJsonContext.Default.AotModel);
+        Check(unicodeModel is { Name: "ä", Replicas: 5, Level: LogLevel.Low }, "non-ASCII round trip through byte APIs");
+
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Chains the input bytes into a segmented <see cref="ReadOnlySequence{T}"/> so the byte
+    /// deserialization path exercises decoder state across segment boundaries.
+    /// </summary>
+    private static ReadOnlySequence<byte> SplitSegments(byte[] bytes, int segmentSize)
+    {
+        var first = new Segment(bytes.AsMemory(0, Math.Min(segmentSize, bytes.Length)), 0);
+        var last = first;
+
+        for (var offset = segmentSize; offset < bytes.Length; offset += segmentSize)
+        {
+            var length = Math.Min(segmentSize, bytes.Length - offset);
+            last = last.Append(bytes.AsMemory(offset, length));
+        }
+
+        return new ReadOnlySequence<byte>(first, 0, last, last.Memory.Length);
+    }
+
+    private sealed class Segment : ReadOnlySequenceSegment<byte>
+    {
+        public Segment(ReadOnlyMemory<byte> memory, long runningIndex)
+        {
+            Memory = memory;
+            RunningIndex = runningIndex;
+        }
+
+        public Segment Append(ReadOnlyMemory<byte> next)
+        {
+            var segment = new Segment(next, RunningIndex + Memory.Length);
+            Next = segment;
+            return segment;
+        }
     }
 }
 
