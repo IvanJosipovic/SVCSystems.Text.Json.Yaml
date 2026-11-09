@@ -191,6 +191,42 @@ public partial class YamlSerializerOptionsTests
     }
 
     [Fact]
+    public void UndefinedDuplicateKeyHandlingIsRejected()
+    {
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions
+        {
+            DuplicateKeyHandling = (YamlDuplicateKeyHandling)99,
+        });
+    }
+
+    [Fact]
+    public void ClonePreservesMergeAndDuplicateKeyOptions()
+    {
+        var options = new YamlSerializerOptions
+        {
+            ResolveMergeKeys = true,
+            DuplicateKeyHandling = YamlDuplicateKeyHandling.LastWins,
+        };
+
+        var clone = options.Clone();
+
+        clone.ResolveMergeKeys.ShouldBeTrue();
+        clone.DuplicateKeyHandling.ShouldBe(YamlDuplicateKeyHandling.LastWins);
+    }
+
+    [Fact]
+    public void SerializesLiteralMergeLookingPropertyNamesAsQuotedKeys()
+    {
+        var values = new Dictionary<string, string> { ["<<"] = "literal" };
+        var yaml = YamlSerializer.Serialize(values, OptionsJsonContext.Default.DictionaryStringString);
+
+        yaml.ShouldContain("\"<<\": literal");
+        var roundTrip = YamlSerializer.Deserialize(yaml, OptionsJsonContext.Default.DictionaryStringString,
+            new YamlSerializerOptions { ResolveMergeKeys = true });
+        roundTrip!["<<"].ShouldBe("literal");
+    }
+
+    [Fact]
     public void UndefinedScalarSchemaIsRejected()
     {
         Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { ScalarSchema = (YamlScalarSchema)99 });

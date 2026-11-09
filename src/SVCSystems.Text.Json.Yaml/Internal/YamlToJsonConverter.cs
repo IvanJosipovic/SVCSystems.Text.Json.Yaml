@@ -33,6 +33,8 @@ internal static class YamlToJsonConverter
         public YamlScalarSchema ScalarSchema { get; } = options?.ScalarSchema ?? YamlScalarSchema.Core;
         public int MaxDepth { get; } = options?.MaxDepth ?? YamlSerializerOptions.DefaultMaxDepth;
         public int MaxScalarLength { get; } = options?.MaxScalarLength ?? 0;
+        public YamlDuplicateKeyHandling DuplicateKeyHandling { get; } = options?.DuplicateKeyHandling ?? YamlDuplicateKeyHandling.Reject;
+        public bool ResolveMergeKeys { get; } = options?.ResolveMergeKeys ?? false;
         public int Depth { get; private set; }
         public List<MappingKeys> KeyStack { get; } = [];
 
@@ -83,6 +85,15 @@ internal static class YamlToJsonConverter
         }
     }
 
+    private sealed class BufferedEventSource(IReadOnlyList<ParsingEvent> events) : EventSource
+    {
+        private int _index;
+
+        public override ParsingEvent? Read() => _index < events.Count ? events[_index++] : null;
+    }
+
+    private sealed record MappingEntry(Scalar Key, List<ParsingEvent> ValueEvents, int Order);
+
     public static void Convert(IParser parser, Utf8JsonWriter writer, YamlSerializerOptions? options = null)
     {
         if (!ConvertNextDocument(parser, writer, options))
@@ -108,6 +119,17 @@ internal static class YamlToJsonConverter
         if (parser.TryConsume<DocumentEnd>(out _))
         {
             writer.WriteNullValue();
+        }
+        else if (parser.Current is Scalar
+                 {
+                     Value.Length: 0,
+                     Style: ScalarStyle.Plain,
+                     IsPlainImplicit: true,
+                 })
+        {
+            writer.WriteNullValue();
+            parser.MoveNext();
+            ConsumeDocumentEnd(parser);
         }
         else
         {
@@ -185,10 +207,73 @@ internal static class YamlToJsonConverter
         writer.WriteStartObject();
         var keys = context.PushMapping();
 
+        if (!context.ResolveMergeKeys && context.DuplicateKeyHandling == YamlDuplicateKeyHandling.Reject)
+        {
+            ConvertMappingStreaming(source, writer, context, keys);
+            context.PopMapping();
+            context.ExitCollection();
+            writer.WriteEndObject();
+            return;
+        }
+
+        List<MappingEntry> entries = [];
+
         while (true)
         {
             var keyEvt = source.Read() ?? throw UnexpectedEnd();
             if (keyEvt is MappingEnd) break;
+
+            if (keyEvt is not Scalar key)
+            {
+                throw keyEvt switch
+                {
+                    AnchorAlias alias => UndefinedAlias(alias),
+                    SequenceStart sequenceKey => new YamlException(sequenceKey.Start, sequenceKey.End,
+                        "Complex mapping keys (sequences or mappings used as keys) are not supported because JSON requires string keys."),
+                    MappingStart mappingKey => new YamlException(mappingKey.Start, mappingKey.End,
+                        "Complex mapping keys (sequences or mappings used as keys) are not supported because JSON requires string keys."),
+                    _ => new YamlException("The YAML input contains an event that is not supported as a mapping key."),
+                };
+            }
+
+            entries.Add(new MappingEntry(key, ReadNodeEvents(source), entries.Count));
+        }
+
+        foreach (var entry in ExpandMergeEntries(entries, context))
+        {
+            var key = entry.Key;
+            ValidateScalarLength(key, context);
+            var (identity, propertyName) = ResolveMappingKey(key, context);
+            if (!keys.Values.Add(identity))
+            {
+                throw new YamlException(key.Start, key.End,
+                    $"The YAML input contains the duplicate mapping key '{key.Value}'. YAML mapping keys must be unique.");
+            }
+
+            if (!keys.JsonNames.Add(propertyName))
+            {
+                throw new YamlException(key.Start, key.End,
+                    $"The scalar mapping key '{key.Value}' collides with another key when projected to the JSON property name '{propertyName}'.");
+            }
+
+            writer.WritePropertyName(propertyName);
+            ConvertNode(new BufferedEventSource(entry.ValueEvents), writer, context);
+        }
+
+        context.PopMapping();
+        context.ExitCollection();
+        writer.WriteEndObject();
+    }
+
+    private static void ConvertMappingStreaming(EventSource source, Utf8JsonWriter writer, Context context, MappingKeys keys)
+    {
+        while (true)
+        {
+            var keyEvt = source.Read() ?? throw UnexpectedEnd();
+            if (keyEvt is MappingEnd)
+            {
+                return;
+            }
 
             if (keyEvt is not Scalar key)
             {
@@ -220,11 +305,325 @@ internal static class YamlToJsonConverter
             writer.WritePropertyName(propertyName);
             ConvertNode(source, writer, context);
         }
-
-        context.PopMapping();
-        context.ExitCollection();
-        writer.WriteEndObject();
     }
+
+    private static List<MappingEntry> ExpandMergeEntries(List<MappingEntry> entries, Context context)
+    {
+        ValidateEntryKeys(entries, context);
+
+        if (!context.ResolveMergeKeys)
+        {
+            if (context.DuplicateKeyHandling == YamlDuplicateKeyHandling.LastWins)
+            {
+                return SelectLastDuplicateEntries(entries, context, ValidateDiscardedValue);
+            }
+
+            return entries;
+        }
+
+        ValidateUniqueEntries(entries, context);
+
+        HashSet<KeyIdentity> explicitIdentities = [];
+        for (var index = 0; index < entries.Count; index++)
+        {
+            var entry = entries[index];
+            if (!IsMergeKey(entry.Key))
+            {
+                explicitIdentities.Add(ResolveMappingKey(entry.Key, context).Identity);
+            }
+        }
+
+        Dictionary<string, int> lastExplicitEntryByName = new(StringComparer.Ordinal);
+        if (context.DuplicateKeyHandling == YamlDuplicateKeyHandling.LastWins)
+        {
+            for (var index = 0; index < entries.Count; index++)
+            {
+                var entry = entries[index];
+                if (!IsMergeKey(entry.Key))
+                {
+                    lastExplicitEntryByName[ResolveMappingKey(entry.Key, context).PropertyName] = index;
+                }
+            }
+        }
+
+        List<MappingEntry> result = [];
+        HashSet<KeyIdentity> mergedIdentities = [];
+        var lastMergeDirective = -1;
+        if (context.DuplicateKeyHandling == YamlDuplicateKeyHandling.LastWins)
+        {
+            for (var index = 0; index < entries.Count; index++)
+            {
+                if (IsMergeKey(entries[index].Key)) lastMergeDirective = index;
+            }
+        }
+
+        foreach (var entry in entries)
+        {
+            if (!IsMergeKey(entry.Key))
+            {
+                var name = ResolveMappingKey(entry.Key, context).PropertyName;
+                if (context.DuplicateKeyHandling != YamlDuplicateKeyHandling.LastWins
+                    || lastExplicitEntryByName[name] == entry.Order)
+                {
+                    result.Add(entry);
+                }
+                else
+                {
+                    ValidateDiscardedValue(entry, context);
+                }
+
+                continue;
+            }
+
+            if (context.DuplicateKeyHandling == YamlDuplicateKeyHandling.LastWins
+                && entry.Order != lastMergeDirective)
+            {
+                continue;
+            }
+
+            foreach (var mergedEntry in ReadMergeEntries(entry, context))
+            {
+                var identity = ResolveMappingKey(mergedEntry.Key, context).Identity;
+                if (explicitIdentities.Contains(identity) || !mergedIdentities.Add(identity))
+                {
+                    ValidateDiscardedValue(mergedEntry, context);
+                    continue;
+                }
+
+                result.Add(mergedEntry with { Order = entry.Order });
+            }
+        }
+
+        if (context.DuplicateKeyHandling == YamlDuplicateKeyHandling.LastWins)
+        {
+            result = SelectLastDuplicateEntries(result, context, ValidateDiscardedValue);
+        }
+
+        return result;
+    }
+
+    private static List<MappingEntry> SelectLastDuplicateEntries(
+        List<MappingEntry> entries,
+        Context context,
+        Action<MappingEntry, Context>? validateDiscarded = null)
+    {
+        Dictionary<string, int> lastIndexByName = new(StringComparer.Ordinal);
+        for (var index = 0; index < entries.Count; index++)
+        {
+            lastIndexByName[ResolveMappingKey(entries[index].Key, context).PropertyName] = index;
+        }
+
+        List<MappingEntry> result = [];
+        for (var index = 0; index < entries.Count; index++)
+        {
+            var entry = entries[index];
+            if (lastIndexByName[ResolveMappingKey(entry.Key, context).PropertyName] == index)
+            {
+                result.Add(entry);
+            }
+            else
+            {
+                validateDiscarded?.Invoke(entry, context);
+            }
+        }
+
+        return result;
+    }
+
+    private static IEnumerable<MappingEntry> ReadMergeEntries(MappingEntry mergeEntry, Context context)
+    {
+        if (mergeEntry.ValueEvents.Count == 0)
+        {
+            throw UnrecognizedMergeKey(mergeEntry.Key);
+        }
+
+        var first = mergeEntry.ValueEvents[0];
+        if (first is MappingStart)
+        {
+            return ExpandMergeSource(mergeEntry.ValueEvents, context);
+        }
+
+        if (first is SequenceStart sequence)
+        {
+            List<MappingEntry> merged = [];
+            ValidateCollectionTag(sequence.Tag, SeqTag, sequence, "sequence");
+            context.EnterCollection(sequence);
+            try
+            {
+                var index = 1;
+                while (index < mergeEntry.ValueEvents.Count && mergeEntry.ValueEvents[index] is not SequenceEnd)
+                {
+                    var start = index;
+                    var value = ReadNodeEvents(mergeEntry.ValueEvents, ref index);
+                    if (value[0] is not MappingStart mapping)
+                    {
+                        throw UnrecognizedMergeKey(mergeEntry.Key);
+                    }
+
+                    ValidateCollectionTag(mapping.Tag, MapTag, mapping, "mapping");
+                    merged.AddRange(ExpandMergeSource(value, context));
+                    if (index <= start)
+                    {
+                        throw UnrecognizedMergeKey(mergeEntry.Key);
+                    }
+                }
+            }
+            finally
+            {
+                context.ExitCollection();
+            }
+
+            return merged;
+        }
+
+        throw UnrecognizedMergeKey(mergeEntry.Key);
+    }
+
+    private static List<MappingEntry> ExpandMergeSource(List<ParsingEvent> mappingEvents, Context context)
+    {
+        var mapping = (MappingStart)mappingEvents[0];
+        ValidateCollectionTag(mapping.Tag, MapTag, mapping, "mapping");
+        context.EnterCollection(mapping);
+        try
+        {
+            var sourceEntries = ReadMappingEntries(mappingEvents);
+            return ExpandMergeEntries(sourceEntries, context);
+        }
+        finally
+        {
+            context.ExitCollection();
+        }
+    }
+
+    private static void ValidateEntryKeys(List<MappingEntry> entries, Context context)
+    {
+        foreach (var entry in entries)
+        {
+            ValidateScalarLength(entry.Key, context);
+            if (!IsMergeKey(entry.Key)) _ = ResolveMappingKey(entry.Key, context);
+        }
+    }
+
+    private static void ValidateDiscardedValue(MappingEntry entry, Context context)
+    {
+        using Utf8JsonWriter writer = new(Stream.Null);
+        ConvertNode(new BufferedEventSource(entry.ValueEvents), writer, context);
+        writer.Flush();
+    }
+
+    private static void ValidateUniqueEntries(List<MappingEntry> entries, Context context)
+    {
+        if (context.DuplicateKeyHandling != YamlDuplicateKeyHandling.Reject)
+        {
+            return;
+        }
+
+        HashSet<KeyIdentity> identities = [];
+        HashSet<string> names = new(StringComparer.Ordinal);
+        var sawMergeKey = false;
+        foreach (var entry in entries)
+        {
+            if (IsMergeKey(entry.Key))
+            {
+                if (sawMergeKey)
+                {
+                    throw new YamlException(entry.Key.Start, entry.Key.End,
+                        "The YAML input contains the duplicate mapping key '<<'. YAML mapping keys must be unique.");
+                }
+
+                sawMergeKey = true;
+                continue;
+            }
+
+            var (identity, name) = ResolveMappingKey(entry.Key, context);
+            if (!identities.Add(identity))
+            {
+                throw new YamlException(entry.Key.Start, entry.Key.End,
+                    $"The YAML input contains the duplicate mapping key '{entry.Key.Value}'. YAML mapping keys must be unique.");
+            }
+
+            if (!names.Add(name))
+            {
+                throw new YamlException(entry.Key.Start, entry.Key.End,
+                    $"The scalar mapping key '{entry.Key.Value}' collides with another key when projected to the JSON property name '{name}'.");
+            }
+        }
+    }
+
+    private static List<MappingEntry> ReadMappingEntries(IReadOnlyList<ParsingEvent> events)
+    {
+        List<MappingEntry> entries = [];
+        var index = 1;
+        while (index < events.Count && events[index] is not MappingEnd)
+        {
+            if (events[index++] is not Scalar key)
+            {
+                throw new YamlException("Complex mapping keys (sequences or mappings used as keys) are not supported because JSON requires string keys.");
+            }
+
+            var valueEvents = ReadNodeEvents(events, ref index);
+            entries.Add(new MappingEntry(key, valueEvents, entries.Count));
+        }
+
+        if (index >= events.Count || events[index] is not MappingEnd)
+        {
+            throw UnexpectedEnd();
+        }
+
+        return entries;
+    }
+
+    private static List<ParsingEvent> ReadNodeEvents(EventSource source)
+    {
+        var first = source.Read() ?? throw UnexpectedEnd();
+        List<ParsingEvent> events = [first];
+        var nesting = first.NestingIncrease;
+        while (nesting > 0)
+        {
+            var next = source.Read() ?? throw UnexpectedEnd();
+            events.Add(next);
+            nesting += next.NestingIncrease;
+        }
+
+        return events;
+    }
+
+    private static List<ParsingEvent> ReadNodeEvents(IReadOnlyList<ParsingEvent> source, ref int index)
+    {
+        if (index >= source.Count)
+        {
+            throw UnexpectedEnd();
+        }
+
+        var first = source[index++];
+        List<ParsingEvent> events = [first];
+        var nesting = first.NestingIncrease;
+        while (nesting > 0)
+        {
+            if (index >= source.Count)
+            {
+                throw UnexpectedEnd();
+            }
+
+            var next = source[index++];
+            events.Add(next);
+            nesting += next.NestingIncrease;
+        }
+
+        return events;
+    }
+
+    private static bool IsMergeKey(Scalar scalar)
+    {
+        const string mergeTag = "tag:yaml.org,2002:merge";
+        return scalar.Value == "<<"
+            && scalar.Style == ScalarStyle.Plain
+            && scalar.Tag != "!"
+            && (!IsTagged(scalar.Tag) || GetTag(scalar.Tag) == mergeTag);
+    }
+
+    private static YamlException UnrecognizedMergeKey(Scalar key) =>
+        new(key.Start, key.End, "Unrecognized merge key pattern");
 
     private static (KeyIdentity Identity, string PropertyName) ResolveMappingKey(Scalar scalar, Context context)
     {
