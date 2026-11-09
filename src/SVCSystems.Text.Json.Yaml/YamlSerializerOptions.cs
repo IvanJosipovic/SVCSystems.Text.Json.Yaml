@@ -272,6 +272,8 @@ public sealed class YamlSerializerOptions
             IndentSize = IndentSize,
             EmitDocumentStart = EmitDocumentStart,
             UseFlowStyle = UseFlowStyle,
+            ResolveMergeKeys = ResolveMergeKeys,
+            DuplicateKeyHandling = DuplicateKeyHandling,
             ScalarSchema = ScalarSchema,
             MaxDepth = MaxDepth,
             MaxScalarLength = MaxScalarLength,

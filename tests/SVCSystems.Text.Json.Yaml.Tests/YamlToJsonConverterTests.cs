@@ -189,15 +189,79 @@ public partial class YamlToJsonConverterTests
     {
         var options = new YamlSerializerOptions { ResolveMergeKeys = true };
         var exception = Should.Throw<YamlException>(() => ConvertToJson("""
-            defaults: &defaults
-              value: first
-              value: second
             target:
               value: explicit
-              <<: *defaults
+              <<: {value: first, value: second}
             """, options));
 
         exception.Message.ShouldContain("duplicate mapping key 'value'");
+    }
+
+    [Fact]
+    public void LastWinsUsesOnlyTheLastMergeDirective()
+    {
+        var options = new YamlSerializerOptions
+        {
+            ResolveMergeKeys = true,
+            DuplicateKeyHandling = YamlDuplicateKeyHandling.LastWins,
+        };
+        var json = ConvertToJson("""
+            target:
+              <<: {fromFirst: yes}
+              <<: {fromLast: yes}
+            """, options);
+
+        using var document = JsonDocument.Parse(json);
+        var target = document.RootElement.GetProperty("target");
+        target.TryGetProperty("fromFirst", out _).ShouldBeFalse();
+        target.GetProperty("fromLast").GetString().ShouldBe("yes");
+    }
+
+    [Fact]
+    public void MergePrecedenceUsesYamlKeyIdentityBeforeJsonNameCollisionChecks()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        Should.Throw<YamlException>(() => ConvertToJson("target: {<<: {true: bool, \"true\": string}}", options))
+            .Message.ShouldContain("collides with another key");
+    }
+
+    [Fact]
+    public void ValidatesValuesAndKeysDiscardedByMergePrecedence()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        Should.Throw<YamlException>(() => ConvertToJson("target: {value: explicit, <<: {value: !!binary bad}}", options))
+            .Message.ShouldContain("not supported");
+        Should.Throw<YamlException>(() => ConvertToJson("target: {value: first, !!binary bad: second}", new YamlSerializerOptions
+        {
+            ResolveMergeKeys = true,
+            DuplicateKeyHandling = YamlDuplicateKeyHandling.LastWins,
+        })).Message.ShouldContain("not supported");
+    }
+
+    [Fact]
+    public void RejectsIncompatibleTagsOnMergeCollections()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        Should.Throw<YamlException>(() => ConvertToJson("target: {<<: !!set {value: yes}}", options))
+            .Message.ShouldContain("not supported on a mapping");
+        Should.Throw<YamlException>(() => ConvertToJson("target: {<<: !!set [{value: yes}]}", options))
+            .Message.ShouldContain("not supported on a sequence");
+    }
+
+    [Fact]
+    public void MergeSourceNestingHonorsMaxDepth()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true, MaxDepth = 2 };
+        Should.Throw<YamlException>(() => ConvertToJson("target: {<<: [{value: {nested: tooDeep}}]}", options))
+            .Message.ShouldContain("maximum nesting depth of 2");
+    }
+
+    [Fact]
+    public void ExplicitNonSpecificTagPreventsMergeKeyRecognition()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        using var document = JsonDocument.Parse(ConvertToJson("target: {! <<: literal}", options));
+        document.RootElement.GetProperty("target").GetProperty("<<").GetString().ShouldBe("literal");
     }
 
     [Fact]

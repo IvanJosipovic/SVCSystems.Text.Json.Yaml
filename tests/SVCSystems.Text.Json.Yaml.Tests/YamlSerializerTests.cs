@@ -460,6 +460,12 @@ public partial class YamlSerializerTests
 
         results[0]!.GetProperty("labels").GetProperty("source").GetString().ShouldBe("first");
         results[1]!.GetProperty("labels").GetProperty("source").GetString().ShouldBe("second");
+
+        Should.Throw<YamlException>(() => YamlSerializer.DeserializeDocuments("""
+            defaults: &defaults {source: first}
+            ---
+            labels: {<<: *defaults}
+            """, AppJsonContext.Default.JsonElement, options));
     }
 
     [Fact]

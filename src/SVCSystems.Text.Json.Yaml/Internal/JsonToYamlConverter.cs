@@ -200,7 +200,10 @@ internal static class JsonToYamlConverter
     /// </summary>
     private static void WriteKeyScalar(IEmitter emitter, string value, EmitterContext context)
     {
-        if (value.Contains('\n') || value.Contains('\r') || context.StringStyle == YamlStringStyle.DoubleQuoted)
+        if (value == "<<"
+            || value.Contains('\n')
+            || value.Contains('\r')
+            || context.StringStyle == YamlStringStyle.DoubleQuoted)
         {
             emitter.Emit(new Scalar(default, default, value, ScalarStyle.DoubleQuoted, false, true));
         }
