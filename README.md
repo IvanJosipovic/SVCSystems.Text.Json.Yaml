@@ -97,6 +97,8 @@ public sealed class YamlSerializerOptions
     public bool EmitDocumentStart { get; set; }        // emit an explicit '---' marker
     public bool UseFlowStyle { get; set; }             // {a: 1} and [1, 2] instead of block style
     public YamlScalarSchema ScalarSchema { get; set; } = YamlScalarSchema.Core; // or Json
+    public bool ResolveMergeKeys { get; set; }               // false by default; YAML 1.1 extension
+    public YamlDuplicateKeyHandling DuplicateKeyHandling { get; set; } // Reject by default
     public int MaxDepth { get; set; } = 64;            // nesting limit
     public int MaxScalarLength { get; set; }           // post-scan acceptance limit; 0: unlimited
     public int MaxAliasExpansionEvents { get; set; } = 1_000_000;
@@ -128,6 +130,7 @@ var yaml = YamlSerializer.Serialize(person, yamlOptions: yamlOptions);
 | Polymorphism, required members, extension data | `JsonSerializerOptions` |
 | IndentSize, document markers, flow style | `YamlSerializerOptions` |
 | Scalar resolution schema | `YamlSerializerOptions` |
+| YAML merge-key resolution and duplicate-key policy | `YamlSerializerOptions` |
 
 YAML options never mutate or override the supplied `JsonSerializerOptions`, and no JSON setting is
 duplicated in `YamlSerializerOptions`.

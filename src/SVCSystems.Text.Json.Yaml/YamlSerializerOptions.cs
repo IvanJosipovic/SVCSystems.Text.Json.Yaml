@@ -39,6 +39,30 @@ public sealed class YamlSerializerOptions
     private int _width = DefaultWidth;
     private int _maxSimpleKeyLength = DefaultMaxSimpleKeyLength;
     private string _newLine = Environment.NewLine;
+    private YamlDuplicateKeyHandling _duplicateKeyHandling;
+
+    /// <summary>
+    /// Gets or sets whether plain YAML merge keys are expanded during deserialization. This is
+    /// disabled by default because merge keys are a YAML 1.1 extension, not part of YAML 1.2 core.
+    /// </summary>
+    public bool ResolveMergeKeys { get; set; }
+
+    /// <summary>
+    /// Gets or sets how duplicate mapping keys are handled. The default is <see cref="YamlDuplicateKeyHandling.Reject"/>.
+    /// </summary>
+    public YamlDuplicateKeyHandling DuplicateKeyHandling
+    {
+        get => _duplicateKeyHandling;
+        set
+        {
+            if (!Enum.IsDefined(value))
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), value, "The duplicate-key handling mode is not valid.");
+            }
+
+            _duplicateKeyHandling = value;
+        }
+    }
 
     /// <summary>
     /// Gets or sets the number of spaces used to indent nested block collections, mirroring

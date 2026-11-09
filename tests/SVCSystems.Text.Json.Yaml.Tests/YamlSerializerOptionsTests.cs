@@ -191,6 +191,15 @@ public partial class YamlSerializerOptionsTests
     }
 
     [Fact]
+    public void UndefinedDuplicateKeyHandlingIsRejected()
+    {
+        Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions
+        {
+            DuplicateKeyHandling = (YamlDuplicateKeyHandling)99,
+        });
+    }
+
+    [Fact]
     public void UndefinedScalarSchemaIsRejected()
     {
         Should.Throw<ArgumentOutOfRangeException>(() => new YamlSerializerOptions { ScalarSchema = (YamlScalarSchema)99 });

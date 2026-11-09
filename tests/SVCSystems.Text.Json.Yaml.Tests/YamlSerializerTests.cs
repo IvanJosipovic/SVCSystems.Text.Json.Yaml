@@ -445,6 +445,40 @@ public partial class YamlSerializerTests
     }
 
     [Fact]
+    public void ReusedAnchorNamesAreScopedToTheirDocumentsWhenResolvingMerges()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        var results = YamlSerializer.DeserializeDocuments("""
+            name: first
+            defaults: &defaults {source: first}
+            labels: {<<: *defaults}
+            ---
+            name: second
+            defaults: &defaults {source: second}
+            labels: {<<: *defaults}
+            """, AppJsonContext.Default.JsonElement, options);
+
+        results[0]!.GetProperty("labels").GetProperty("source").GetString().ShouldBe("first");
+        results[1]!.GetProperty("labels").GetProperty("source").GetString().ShouldBe("second");
+    }
+
+    [Fact]
+    public void CommentOnlyDocumentsAreNullInDocumentStreams()
+    {
+        var results = YamlSerializer.DeserializeDocuments("""
+            value: before
+            --- # template emitted an empty document
+            ---
+            value: after
+            """, AppJsonContext.Default.JsonElement);
+
+        results.Count.ShouldBe(3);
+        results[0]!.GetProperty("value").GetString().ShouldBe("before");
+        results[1].ValueKind.ShouldBe(JsonValueKind.Null);
+        results[2]!.GetProperty("value").GetString().ShouldBe("after");
+    }
+
+    [Fact]
     public void DeserializesAnEmptyStreamToAnEmptyList()
     {
         YamlSerializer.DeserializeDocuments("", AppJsonContext.Default.Person).ShouldBeEmpty();

@@ -154,6 +154,74 @@ public partial class YamlToJsonConverterTests
     }
 
     [Fact]
+    public void ResolvesMergeKeysWithYamlPrecedenceWhenEnabled()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        var json = ConvertToJson("""
+            first: &first
+              winner: first
+              fromFirst: true
+            second: &second
+              winner: second
+              fromSecond: true
+            target:
+              winner: explicit
+              <<: [*first, *second]
+            """, options);
+
+        using var document = JsonDocument.Parse(json);
+        var target = document.RootElement.GetProperty("target");
+        target.GetProperty("winner").GetString().ShouldBe("explicit");
+        target.GetProperty("fromFirst").GetBoolean().ShouldBeTrue();
+        target.GetProperty("fromSecond").GetBoolean().ShouldBeTrue();
+
+        var firstWins = ConvertToJson("""
+            first: &first {winner: first}
+            second: &second {winner: second}
+            target: {<<: [*first, *second]}
+            """, options);
+        using var firstWinsDocument = JsonDocument.Parse(firstWins);
+        firstWinsDocument.RootElement.GetProperty("target").GetProperty("winner").GetString().ShouldBe("first");
+    }
+
+    [Fact]
+    public void RejectsDuplicateKeysInsideMergedMappings()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        var exception = Should.Throw<YamlException>(() => ConvertToJson("""
+            defaults: &defaults
+              value: first
+              value: second
+            target:
+              value: explicit
+              <<: *defaults
+            """, options));
+
+        exception.Message.ShouldContain("duplicate mapping key 'value'");
+    }
+
+    [Fact]
+    public void QuotedAndExplicitStringMergeLookingKeysStayOrdinaryWhenMergeResolutionIsEnabled()
+    {
+        var options = new YamlSerializerOptions { ResolveMergeKeys = true };
+        var quotedJson = ConvertToJson("\"<<\": quoted", options);
+        var taggedJson = ConvertToJson("!!str <<: tagged", options);
+
+        using var quotedDocument = JsonDocument.Parse(quotedJson);
+        using var taggedDocument = JsonDocument.Parse(taggedJson);
+        quotedDocument.RootElement.GetProperty("<<").GetString().ShouldBe("quoted");
+        taggedDocument.RootElement.GetProperty("<<").GetString().ShouldBe("tagged");
+    }
+
+    [Fact]
+    public void LastWinsDuplicateModeKeepsTheLastProjectedKey()
+    {
+        var options = new YamlSerializerOptions { DuplicateKeyHandling = YamlDuplicateKeyHandling.LastWins };
+
+        ConvertToJson("value: first\nvalue: second", options).ShouldBe("{\"value\":\"second\"}");
+    }
+
+    [Fact]
     public void ExpandsNestedAnchors()
     {
         var json = ConvertToJson("""
