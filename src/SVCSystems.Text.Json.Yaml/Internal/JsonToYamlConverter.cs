@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using YamlDotNet.Core;
 using YamlDotNet.Core.Events;
 
@@ -75,31 +77,287 @@ internal static class JsonToYamlConverter
 
     public static void Convert(ReadOnlySpan<byte> utf8Json, IBufferWriter<byte> output, YamlSerializerOptions? options = null)
     {
-        // The emitter's characters are UTF-8 encoded straight into the caller's buffers; the
-        // writer's dispose performs the final flush (pending surrogate handling).
-        using var textWriter = new Utf8BufferTextWriter(output);
-        Convert(utf8Json, textWriter, options);
-    }
+        ArgumentNullException.ThrowIfNull(output);
 
-    public static void Convert(ReadOnlySpan<byte> utf8Json, TextWriter output, YamlSerializerOptions? options = null)
-    {
-        var context = new EmitterContext(options);
-        var emitter = new Emitter(output, CreateEmitterSettings(options));
+        using var writer = new StreamingWriter(output, options);
 
-        emitter.Emit(new StreamStart());
-        emitter.Emit(new DocumentStart(null, null, options is null || !options.EmitDocumentStart, Mark.Empty, Mark.Empty));
-
-        var reader = new Utf8JsonReader(utf8Json);
-
-        if (!reader.Read())
+        while (!utf8Json.IsEmpty)
         {
-            throw new InvalidOperationException("The JSON payload produced by System.Text.Json is empty.");
+            var count = Math.Min(utf8Json.Length, 4096);
+            utf8Json[..count].CopyTo(writer.GetSpan(count));
+            writer.Advance(count);
+            utf8Json = utf8Json[count..];
         }
 
-        ConvertNode(ref reader, emitter, context);
+        writer.Complete();
+    }
 
-        emitter.Emit(new DocumentEnd(true, Mark.Empty, Mark.Empty));
-        emitter.Emit(new StreamEnd());
+    /// <summary>Serializes a value to YAML without staging its complete JSON representation.</summary>
+    public static void Serialize<T>(T value, JsonTypeInfo<T> jsonTypeInfo, IBufferWriter<byte> output, YamlSerializerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+        ArgumentNullException.ThrowIfNull(output);
+
+        using var yamlWriter = new StreamingWriter(output, options);
+        using (var jsonWriter = new Utf8JsonWriter(yamlWriter))
+        {
+            JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
+        }
+
+        yamlWriter.Complete();
+    }
+
+    /// <summary>Serializes a value to YAML without staging its complete JSON representation.</summary>
+    [RequiresUnreferencedCode("JSON serialization uses reflection and cannot be statically analyzed. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    [RequiresDynamicCode("JSON serialization may require dynamic code. Use the overload accepting a JsonTypeInfo<T> for trimming and Native AOT support.")]
+    public static void Serialize<T>(T value, JsonSerializerOptions? jsonOptions, IBufferWriter<byte> output, YamlSerializerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+
+        using var yamlWriter = new StreamingWriter(output, options);
+        using (var jsonWriter = new Utf8JsonWriter(yamlWriter))
+        {
+            JsonSerializer.Serialize(jsonWriter, value, jsonOptions);
+        }
+
+        yamlWriter.Complete();
+    }
+
+    /// <summary>
+    /// Receives arbitrary UTF-8 chunks from <see cref="Utf8JsonWriter"/>, incrementally parses
+    /// complete JSON tokens, and emits matching YAML events. Only an incomplete trailing JSON
+    /// token is retained between writes.
+    /// </summary>
+    private sealed class StreamingWriter : IBufferWriter<byte>, IDisposable
+    {
+        private const int InitialInputSize = 4096;
+
+        private readonly IBufferWriter<byte> _output;
+        private readonly TextWriter _textWriter;
+        private readonly Emitter _emitter;
+        private readonly EmitterContext _context;
+        private readonly List<HashSet<string>?> _collections = [];
+        private byte[] _input = ArrayPool<byte>.Shared.Rent(InitialInputSize);
+        private int _inputLength;
+        private JsonReaderState _readerState;
+        private bool _sawRootValue;
+        private bool _completed;
+        private bool _disposed;
+
+        public StreamingWriter(IBufferWriter<byte> output, YamlSerializerOptions? options)
+        {
+            _output = output ?? throw new ArgumentNullException(nameof(output));
+            _textWriter = new Utf8BufferTextWriter(output);
+            _emitter = new Emitter(_textWriter, CreateEmitterSettings(options));
+            _context = new EmitterContext(options);
+
+            _emitter.Emit(new StreamStart());
+            _emitter.Emit(new DocumentStart(null, null, options is null || !options.EmitDocumentStart, Mark.Empty, Mark.Empty));
+        }
+
+        public void Advance(int count)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, nameof(StreamingWriter));
+            ObjectDisposedException.ThrowIf(_completed, nameof(StreamingWriter));
+            ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+            if (count > _input.Length - _inputLength)
+            {
+                throw new ArgumentOutOfRangeException(nameof(count));
+            }
+
+            _inputLength += count;
+            ProcessInput(isFinalBlock: false);
+        }
+
+        public Memory<byte> GetMemory(int sizeHint = 0) => GetBuffer(sizeHint).AsMemory(_inputLength);
+
+        public Span<byte> GetSpan(int sizeHint = 0) => GetBuffer(sizeHint).AsSpan(_inputLength);
+
+        public void Complete()
+        {
+            ObjectDisposedException.ThrowIf(_disposed, nameof(StreamingWriter));
+            ObjectDisposedException.ThrowIf(_completed, nameof(StreamingWriter));
+
+            ProcessInput(isFinalBlock: true);
+
+            if (!_sawRootValue)
+            {
+                throw new InvalidOperationException("The JSON payload produced by System.Text.Json is empty.");
+            }
+
+            if (_collections.Count != 0)
+            {
+                throw new JsonException("The JSON payload ended before all collections were closed.");
+            }
+
+            _emitter.Emit(new DocumentEnd(true, Mark.Empty, Mark.Empty));
+            _emitter.Emit(new StreamEnd());
+            _textWriter.Flush();
+
+            if (_output is IFlushableBufferWriter flushable)
+            {
+                flushable.Flush();
+            }
+
+            _completed = true;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            try
+            {
+                _textWriter.Dispose();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(_input);
+                _input = [];
+                _inputLength = 0;
+                _disposed = true;
+            }
+        }
+
+        private void ProcessInput(bool isFinalBlock)
+        {
+            var reader = new Utf8JsonReader(_input.AsSpan(0, _inputLength), isFinalBlock, _readerState);
+
+            while (reader.Read())
+            {
+                ConvertToken(ref reader);
+            }
+
+            var consumed = checked((int)reader.BytesConsumed);
+            _readerState = reader.CurrentState;
+
+            if (consumed > 0)
+            {
+                var remaining = _inputLength - consumed;
+                if (remaining > 0)
+                {
+                    Buffer.BlockCopy(_input, consumed, _input, 0, remaining);
+                }
+
+                _inputLength = remaining;
+            }
+
+            if (isFinalBlock && _inputLength != 0)
+            {
+                throw new JsonException("The JSON payload ended in the middle of a token.");
+            }
+        }
+
+        private void ConvertToken(ref Utf8JsonReader reader)
+        {
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.StartObject:
+                    _sawRootValue = true;
+                    _emitter.Emit(new MappingStart(default, default, true, _context.MappingStyle));
+                    _collections.Add(new HashSet<string>(StringComparer.Ordinal));
+                    return;
+
+                case JsonTokenType.EndObject:
+                    if (_collections.Count == 0 || _collections[^1] is null)
+                    {
+                        throw new JsonException("Unexpected JSON object terminator.");
+                    }
+
+                    _collections.RemoveAt(_collections.Count - 1);
+                    _emitter.Emit(new MappingEnd());
+                    return;
+
+                case JsonTokenType.StartArray:
+                    _sawRootValue = true;
+                    _emitter.Emit(new SequenceStart(default, default, true, _context.SequenceStyle));
+                    _collections.Add(null);
+                    return;
+
+                case JsonTokenType.EndArray:
+                    if (_collections.Count == 0 || _collections[^1] is not null)
+                    {
+                        throw new JsonException("Unexpected JSON array terminator.");
+                    }
+
+                    _collections.RemoveAt(_collections.Count - 1);
+                    _emitter.Emit(new SequenceEnd());
+                    return;
+
+                case JsonTokenType.PropertyName:
+                {
+                    if (_collections.Count == 0 || _collections[^1] is not { } names)
+                    {
+                        throw new JsonException("Unexpected JSON property name outside an object.");
+                    }
+
+                    var name = reader.GetString()!;
+                    if (!names.Add(name))
+                    {
+                        throw new JsonException($"The JSON object contains the duplicate property name '{name}', which cannot be serialized as a YAML mapping.");
+                    }
+
+                    WriteKeyScalar(_emitter, name, _context);
+                    return;
+                }
+
+                case JsonTokenType.String:
+                    _sawRootValue = true;
+                    WriteScalar(_emitter, reader.GetString()!, _context);
+                    return;
+
+                case JsonTokenType.Number:
+                    _sawRootValue = true;
+                    _emitter.Emit(new Scalar(GetRawText(ref reader)));
+                    return;
+
+                case JsonTokenType.True:
+                    _sawRootValue = true;
+                    _emitter.Emit(new Scalar("true"));
+                    return;
+
+                case JsonTokenType.False:
+                    _sawRootValue = true;
+                    _emitter.Emit(new Scalar("false"));
+                    return;
+
+                case JsonTokenType.Null:
+                    _sawRootValue = true;
+                    _emitter.Emit(new Scalar("null"));
+                    return;
+
+                default:
+                    throw new JsonException($"Unexpected JSON token '{reader.TokenType}'.");
+            }
+        }
+
+        private byte[] GetBuffer(int sizeHint)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, nameof(StreamingWriter));
+            ObjectDisposedException.ThrowIf(_completed, nameof(StreamingWriter));
+            ArgumentOutOfRangeException.ThrowIfNegative(sizeHint, nameof(sizeHint));
+
+            if (sizeHint == 0)
+            {
+                sizeHint = 1;
+            }
+
+            if (_inputLength + sizeHint <= _input.Length)
+            {
+                return _input;
+            }
+
+            var newSize = Math.Max(_inputLength + sizeHint, _input.Length * 2);
+            var newInput = ArrayPool<byte>.Shared.Rent(newSize);
+            Buffer.BlockCopy(_input, 0, newInput, 0, _inputLength);
+            ArrayPool<byte>.Shared.Return(_input);
+            _input = newInput;
+            return _input;
+        }
     }
 
     internal static EmitterSettings CreateEmitterSettings(YamlSerializerOptions? options)
@@ -117,80 +375,6 @@ internal static class JsonToYamlConverter
             .WithMaxSimpleKeyLength(options.MaxSimpleKeyLength);
 
         return options.IndentedSequences ? settings.WithIndentedSequences() : settings;
-    }
-
-    private static void ConvertNode(ref Utf8JsonReader reader, IEmitter emitter, EmitterContext context)
-    {
-        switch (reader.TokenType)
-        {
-            case JsonTokenType.StartObject:
-            {
-                emitter.Emit(new MappingStart(default, default, true, context.MappingStyle));
-                var propertyNames = new HashSet<string>(StringComparer.Ordinal);
-
-                while (reader.Read())
-                {
-                    if (reader.TokenType == JsonTokenType.EndObject)
-                    {
-                        break;
-                    }
-
-                    if (reader.TokenType != JsonTokenType.PropertyName)
-                    {
-                        throw new InvalidOperationException($"Unexpected JSON token '{reader.TokenType}' inside an object.");
-                    }
-
-                    var name = reader.GetString()!;
-                    if (!propertyNames.Add(name))
-                    {
-                        throw new JsonException($"The JSON object contains the duplicate property name '{name}', which cannot be serialized as a YAML mapping.");
-                    }
-
-                    WriteKeyScalar(emitter, name, context);
-
-                    reader.Read();
-                    ConvertNode(ref reader, emitter, context);
-                }
-
-                emitter.Emit(new MappingEnd());
-                break;
-            }
-            case JsonTokenType.StartArray:
-            {
-                emitter.Emit(new SequenceStart(default, default, true, context.SequenceStyle));
-
-                while (reader.Read())
-                {
-                    if (reader.TokenType == JsonTokenType.EndArray)
-                    {
-                        break;
-                    }
-
-                    ConvertNode(ref reader, emitter, context);
-                }
-
-                emitter.Emit(new SequenceEnd());
-                break;
-            }
-            case JsonTokenType.String:
-                WriteScalar(emitter, reader.GetString()!, context);
-                break;
-            case JsonTokenType.Number:
-                // Numbers keep their exact textual representation and are emitted as plain scalars.
-                emitter.Emit(new Scalar(GetRawText(ref reader)));
-                break;
-            case JsonTokenType.True:
-                emitter.Emit(new Scalar("true"));
-                break;
-            case JsonTokenType.False:
-                emitter.Emit(new Scalar("false"));
-                break;
-            case JsonTokenType.Null:
-                emitter.Emit(new Scalar("null"));
-                break;
-            default:
-                throw new InvalidOperationException($"Unexpected JSON token '{reader.TokenType}'.");
-        }
     }
 
     /// <summary>

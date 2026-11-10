@@ -76,6 +76,19 @@ public partial class BufferApiTests
     }
 
     [Fact]
+    public void EncodesSurrogatePairAcrossInternalByteBufferBoundary()
+    {
+        var prefix = new string('a', 4095);
+
+        WrittenBytes(w =>
+        {
+            w.Write(prefix);
+            w.Write('\ud83c');
+            w.Write('\udf89');
+        }).ShouldBe(Encoding.UTF8.GetBytes(prefix + "\U0001F389"));
+    }
+
+    [Fact]
     public void EncodesSurrogatePairSplitAcrossBulkAndSingleCharWrites()
     {
         WrittenBytes(w =>
@@ -598,6 +611,20 @@ public partial class BufferApiTests
 
         await Should.ThrowAsync<OperationCanceledException>(() =>
             YamlSerializer.DeserializeAsync(stream, TypeInfo(x => x.Person), null, new CancellationToken(true)));
+    }
+
+    [Fact]
+    public async Task DeserializeAsyncFromStreamPreservesYamlErrorsAcrossThePipe()
+    {
+        // The first document spills the converted JSON to the bounded pipe before the parser
+        // encounters the second document and reports the YAML error.
+        var largeName = new string('x', 160 * 1024);
+        using var stream = new MemoryStream(Utf8($"Name: {largeName}\n---\nName: John\n"));
+
+        var exception = await Should.ThrowAsync<YamlException>(async () =>
+            await YamlSerializer.DeserializeAsync(stream, TypeInfo(x => x.Person)));
+
+        exception.Message.ShouldContain("Multiple YAML documents");
     }
 
     [Fact]

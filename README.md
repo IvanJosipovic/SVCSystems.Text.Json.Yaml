@@ -330,7 +330,10 @@ var config2 = await YamlSerializer.DeserializeAsync(yamlBytes, ConfigJsonContext
 - A small number of yaml-test-suite cases deviate from the upstream YamlDotNet scanner (tab
   handling, some block scalar chomping edge cases); each is named and skipped with a reason in
   the conformance suite.
-- Intermediate JSON is buffered; the reflection based overloads need runtime reflection.
+- Async stream deserialization stages the UTF-8 YAML input because YamlDotNet's parser is
+  synchronous. Small converted JSON payloads use a bounded pooled-memory fast path; larger payloads
+  spill through a bounded pipe to `System.Text.Json`.
+- The reflection based overloads need runtime reflection.
 - YamlDotNet's emitter escapes some non-ASCII scalars (for example emoji) using double quoted
   escapes; the values still round trip exactly.
 - Block sequences under a mapping key are emitted at the parent indentation level
@@ -338,57 +341,72 @@ var config2 = await YamlSerializer.DeserializeAsync(yamlBytes, ConfigJsonContext
 
 ## Performance considerations
 
-The pipeline is `object → JSON (System.Text.Json) → YAML (token bridge)`. Intermediate JSON is
-staged in pooled buffers (`ArrayPool<byte>` backed writers), so no large intermediate arrays are
-allocated per call. Benchmarks (BenchmarkDotNet, `benchmarks/`) compare YamlDotNet's reflection
+The pipeline is `object → JSON tokens (System.Text.Json) → YAML events (YamlDotNet)`. JSON is
+consumed incrementally; a complete intermediate JSON document is not staged for serialization.
+Stream deserialization keeps converted JSON in pooled memory up to a fixed threshold, then spills to
+a bounded pipe. The async input-stream path still stages the source UTF-8 YAML because YamlDotNet's
+parser is synchronous. Benchmarks (BenchmarkDotNet, `benchmarks/`) compare YamlDotNet's reflection
 based serializer with this library in reflection and source generated modes:
 
 ```sh
 dotnet run --project benchmarks/SVCSystems.Text.Json.Yaml.Benchmarks -c Release -- --filter '*'
 ```
 
-Correctness and compatibility were prioritized over micro-optimization. The `IBufferWriter<byte>`
-serialize overload emits UTF-8 directly into the caller's writer. String and `Stream` overloads
-stage the complete YAML document in pooled UTF-8 buffers before constructing the returned string
-or writing it to the stream. Deserialization decodes UTF-8 incrementally into characters as the
+String and byte-returning overloads necessarily aggregate the YAML result, but no longer allocate a
+second, complete JSON document. The `IBufferWriter<byte>` overload writes directly to the caller's
+writer; synchronous stream serialization writes bounded UTF-8 chunks, while async stream
+serialization stages small results in pooled memory before using the bounded pipe for larger
+outputs and asynchronous backpressure. Stream deserialization uses the same memory-first threshold
+strategy for its JSON bridge. Deserialization decodes UTF-8 incrementally into characters as the
 parser pulls them (no whole-input UTF-16 string on any path). The one remaining known deficit is
-deserializing a single very large scalar (scanner-internal); a raw UTF-8 front-end for the
-scanner is recorded as future work in `docs/phase-7-completion-plan.md`.
+deserializing a single very large scalar
+(scanner-internal); a raw UTF-8 front-end for the scanner is recorded as future work in
+`docs/phase-7-completion-plan.md`.
 
-### Recorded results
+### Object-engine comparison
 
-BenchmarkDotNet `ShortRun`, linux-x64, .NET 11. Time and allocation ratios use the matching
-YamlDotNet reflection operation as the 1.00x baseline:
-
-| Scenario | Serialize time | Serialize alloc | Deserialize time | Deserialize alloc |
-|---|---|---|---|---|
-| Small config (6 properties) | 0.30x (contracts) | 0.27x | 0.78x | 0.88x |
-| Kubernetes manifest (10 containers) | 0.41x | 0.45x | 0.74x | 1.06x |
-| 1,000 item list | 0.32x | 0.46x | 0.64x | 1.06x |
-| 64 KB scalar document | 0.93x | 0.92x | 0.65x | 1.44x |
-
-Reflection mode tracks the source generated mode closely (within ~5-10%). The token bridge is
-faster and allocates less than YamlDotNet's reflection based object engine for structured data.
-Emitter output is encoded directly into pooled UTF-8 buffers (no intermediate `StringBuilder`).
-The one remaining deficit is deserialize allocations for a single large scalar, which is
-YamlDotNet scanner-internal (it materializes the scalar as a UTF-16 string while scanning) and
-is therefore only addressable by the UTF-8 native front-end work.
+The earlier YamlDotNet object-engine comparison used ShortRun and is not reported here as a
+performance comparison. A full before/after run against YamlDotNet has not been made for this
+change.
 
 ### Sync vs async stream overloads (MemoryStream, no device I/O)
 
-| Operation | Sync | Async | Delta |
-|---|---|---|---|
-| Serialize small | 17.4 µs / 4.98 KB | 18.0 µs / 4.98 KB | ≈ equal |
-| Serialize 64 KB scalar | 3,311 µs / 194.25 KB | 3,515 µs / 194.30 KB | allocation parity (batched write in both) |
-| Deserialize small | 38.4 µs / 19.64 KB | 44.5 µs / 18.63 KB | async slightly slower and lighter |
-| Deserialize 64 KB scalar | 2,274 µs / 410.76 KB | 2,482 µs / 409.78 KB | allocation parity (async stages UTF-8 in pooled buffers and decodes incrementally) |
+The tables compare the same BenchmarkDotNet `DefaultJob` cases on clean HEAD and the current
+implementation on linux-x64 / .NET 11. Values are mean time / allocated memory. The clean-HEAD
+baseline was rerun in a detached worktree. That run reported a 3.30 GHz maximum CPU frequency,
+while the current implementation run reported 2.52 GHz, so cross-run time changes are directional rather than a
+controlled speedup measurement; allocated bytes are more comparable. Rerun both revisions under
+the same CPU conditions for precise timing comparisons.
 
-Guidance: serialize allocates identically for sync and async (the document is encoded into
-pooled UTF-8 buffers and written with a single call). Deserialize has allocation parity between
-sync and async: both decode incrementally and neither materializes a whole-input UTF-16 string;
-the async overload additionally stages the UTF-8 input (the YAML scanner reads it more than
-once), keeping its allocation profile proportional to input size. Prefer sync for
-memory-constrained large payloads; prefer async when cancellation during the read matters.
+| Operation | Before | After | Time change |
+|---|---:|---:|---:|
+| Serialize small, sync | 17.96 µs / 4.98 KB | 17.72 µs / 5.17 KB | -1.3% |
+| Serialize small, async | 18.67 µs / 4.98 KB | 17.89 µs / 5.39 KB | -4.2% |
+| Serialize 64 KB scalar, sync | 3,494.27 µs / 194.25 KB | 3,018.03 µs / 194.48 KB | -13.6% |
+| Serialize 64 KB scalar, async | 3,356.79 µs / 194.25 KB | 3,170.38 µs / 194.67 KB | -5.6% |
+| Deserialize small, sync | 45.05 µs / 19.65 KB | 45.99 µs / 19.97 KB | +2.1% |
+| Deserialize small, async | 43.30 µs / 18.63 KB | 45.65 µs / 19.04 KB | +5.4% |
+| Deserialize 64 KB scalar, sync | 2,531.25 µs / 410.78 KB | 2,718.48 µs / 413.24 KB | +7.4% |
+| Deserialize 64 KB scalar, async | 2,522.78 µs / 409.79 KB | 2,851.27 µs / 413.21 KB | +13.0% |
+
+The stream benchmark uses a fresh `MemoryStream`; its backing-store growth is included, so chunked
+writes can increase measured allocation compared with a single batched write. The bounded-pipe
+bridges also add overhead. The full run shows a throughput and allocation cost in the stream
+overloads; the 64 KB scalar case also has to retain an individual token while parsing. Async stream
+deserialization still stages the UTF-8 YAML input for YamlDotNet's synchronous scanner.
+
+### Buffer and byte API benchmarks
+
+| Operation | Before | After | Time change |
+|---|---:|---:|---:|
+| Serialize small, sink | 19.54 µs / 4.91 KB | 17.27 µs / 5.10 KB | -11.6% |
+| Serialize large, sink | 4,121.03 µs / 386.13 KB | 3,293.73 µs / 382.52 KB | -20.1% |
+| Serialize small, string | 17.46 µs / 4.92 KB | 17.63 µs / 5.11 KB | +1.0% |
+| Serialize large, string | 3,456.65 µs / 258.24 KB | 3,232.68 µs / 258.43 KB | -6.5% |
+| Deserialize small, bytes | 45.81 µs / 18.37 KB | 41.69 µs / 18.37 KB | -9.0% |
+| Deserialize large, bytes | 2,551.94 µs / 409.52 KB | 2,408.14 µs / 409.52 KB | -5.6% |
+| Deserialize small, string | 41.10 µs / 16.24 KB | 38.86 µs / 16.24 KB | -5.5% |
+| Deserialize large, string | 2,488.49 µs / 407.34 KB | 2,617.03 µs / 407.35 KB | +5.2% |
 
 ## Building from source
 

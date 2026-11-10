@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using System.Text;
 using SVCSystems.Text.Json.Yaml.Internal;
 using YamlDotNet.Core;
 
@@ -45,6 +46,21 @@ public partial class JsonToYamlConverterTests
         var yaml = JsonToYamlConverter.ConvertToString("""{"int":42,"float":1.50,"exp":1e30}"""u8);
 
         yaml.ReplaceLineEndings("\n").ShouldBe("int: 42\nfloat: 1.50\nexp: 1e30\n");
+    }
+
+    [Fact]
+    public void ConvertsAcrossUtf8ChunkBoundariesInsideUnicodeScalars()
+    {
+        // The emoji begins at byte 4095, so its four-byte UTF-8 encoding crosses the
+        // converter's 4096-byte input chunk boundary.
+        var json = "{\"value\":\"" + new string('x', 4085) + "🎉" + new string('y', 12_000) + "\",\"number\":1.50}";
+        var expected = JsonSerializer.Deserialize(json, JsonElementContext.Default.JsonElement);
+        var yaml = JsonToYamlConverter.ConvertToString(Encoding.UTF8.GetBytes(json));
+
+        var actual = SVCSystems.Text.Json.Yaml.YamlSerializer.Deserialize(yaml, JsonElementContext.Default.JsonElement);
+
+        JsonSerializer.Serialize(actual, JsonElementContext.Default.JsonElement)
+            .ShouldBe(JsonSerializer.Serialize(expected, JsonElementContext.Default.JsonElement));
     }
 
     [Fact]

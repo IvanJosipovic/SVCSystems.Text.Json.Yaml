@@ -640,7 +640,7 @@ public partial class YamlSerializerTests
     [Fact]
     public async Task AsyncOverloadsHandleUtf8BomAndLargePayloads()
     {
-        var large = new string('x', 128 * 1024);
+        var large = new string('x', 256 * 1024);
         var model = new Dictionary<string, string> { ["text"] = large };
 
         using var serializeStream = new MemoryStream();
@@ -649,6 +649,22 @@ public partial class YamlSerializerTests
 
         serializeStream.Position = 0;
         var result = await YamlSerializer.DeserializeAsync(serializeStream, AppJsonContext.Default.DictionaryStringString);
+
+        result.ShouldNotBeNull();
+        result["text"].ShouldBe(large);
+    }
+
+    [Fact]
+    public void SyncStreamOverloadsHandlePayloadsPastAdaptiveBufferThreshold()
+    {
+        var large = new string('x', 256 * 1024);
+        var model = new Dictionary<string, string> { ["text"] = large };
+
+        using var stream = new MemoryStream();
+        YamlSerializer.Serialize(stream, model, AppJsonContext.Default.DictionaryStringString);
+
+        stream.Position = 0;
+        var result = YamlSerializer.Deserialize(stream, AppJsonContext.Default.DictionaryStringString);
 
         result.ShouldNotBeNull();
         result["text"].ShouldBe(large);

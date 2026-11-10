@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
+using System.IO.Pipelines;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -125,12 +127,8 @@ public static class YamlSerializer
 
         try
         {
-            using (var writer = new Utf8JsonWriter(buffer))
-            {
-                JsonSerializer.Serialize(writer, value, jsonOptions);
-            }
-
-            return JsonToYamlConverter.ConvertToString(buffer.WrittenSpan, yamlOptions);
+            JsonToYamlConverter.Serialize(value, jsonOptions, buffer, yamlOptions);
+            return Encoding.UTF8.GetString(buffer.WrittenSpan);
         }
         finally
         {
@@ -155,12 +153,8 @@ public static class YamlSerializer
 
         try
         {
-            using (var writer = new Utf8JsonWriter(buffer))
-            {
-                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
-            }
-
-            return JsonToYamlConverter.ConvertToString(buffer.WrittenSpan, yamlOptions);
+            JsonToYamlConverter.Serialize(value, jsonTypeInfo, buffer, yamlOptions);
+            return Encoding.UTF8.GetString(buffer.WrittenSpan);
         }
         finally
         {
@@ -187,12 +181,8 @@ public static class YamlSerializer
 
         try
         {
-            using (var writer = new Utf8JsonWriter(buffer))
-            {
-                JsonSerializer.Serialize(writer, value, jsonOptions);
-            }
-
-            return JsonToYamlConverter.ConvertToUtf8Bytes(buffer.WrittenSpan, yamlOptions);
+            JsonToYamlConverter.Serialize(value, jsonOptions, buffer, yamlOptions);
+            return buffer.WrittenSpan.ToArray();
         }
         finally
         {
@@ -217,12 +207,8 @@ public static class YamlSerializer
 
         try
         {
-            using (var writer = new Utf8JsonWriter(buffer))
-            {
-                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
-            }
-
-            return JsonToYamlConverter.ConvertToUtf8Bytes(buffer.WrittenSpan, yamlOptions);
+            JsonToYamlConverter.Serialize(value, jsonTypeInfo, buffer, yamlOptions);
+            return buffer.WrittenSpan.ToArray();
         }
         finally
         {
@@ -244,36 +230,8 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
-        // The YAML document is encoded into pooled UTF-8 buffers and written with a single call,
-        // mirroring SerializeAsync (batched write) instead of chunked streaming.
-        var jsonBuffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var writer = new Utf8JsonWriter(jsonBuffer))
-            {
-                JsonSerializer.Serialize(writer, value, jsonTypeInfo);
-            }
-
-            var yamlBuffer = new PooledBufferWriter();
-
-            try
-            {
-                // The emitter's characters are UTF-8 encoded straight into pooled buffers, with
-                // no intermediate StreamWriter char buffer.
-                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
-
-                stream.Write(yamlBuffer.WrittenSpan);
-            }
-            finally
-            {
-                yamlBuffer.Dispose();
-            }
-        }
-        finally
-        {
-            jsonBuffer.Dispose();
-        }
+        using var output = new StreamBufferWriter(stream);
+        JsonToYamlConverter.Serialize(value, jsonTypeInfo, output, yamlOptions);
     }
 
     /// <summary>
@@ -291,32 +249,8 @@ public static class YamlSerializer
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        var jsonBuffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
-            {
-                JsonSerializer.Serialize(jsonWriter, value, jsonOptions);
-            }
-
-            var yamlBuffer = new PooledBufferWriter();
-
-            try
-            {
-                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
-
-                stream.Write(yamlBuffer.WrittenSpan);
-            }
-            finally
-            {
-                yamlBuffer.Dispose();
-            }
-        }
-        finally
-        {
-            jsonBuffer.Dispose();
-        }
+        using var output = new StreamBufferWriter(stream);
+        JsonToYamlConverter.Serialize(value, jsonOptions, output, yamlOptions);
     }
 
     /// <summary>
@@ -325,8 +259,8 @@ public static class YamlSerializer
     /// </summary>
     /// <remarks>
     /// The YAML is UTF-8 encoded directly into the buffers supplied by the writer; the writer is
-    /// neither closed nor disposed, and is left positioned after the written bytes. Object
-    /// serialization still stages the intermediate JSON token stream in pooled buffers.
+    /// neither closed nor disposed, and is left positioned after the written bytes. JSON tokens
+    /// are converted incrementally, so no complete intermediate JSON document is staged.
     /// </remarks>
     /// <typeparam name="T">The type of the value to serialize.</typeparam>
     /// <param name="writer">The buffer writer to write UTF-8 encoded YAML to.</param>
@@ -339,21 +273,7 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
-        var jsonBuffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
-            {
-                JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
-            }
-
-            JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, writer, yamlOptions);
-        }
-        finally
-        {
-            jsonBuffer.Dispose();
-        }
+        JsonToYamlConverter.Serialize(value, jsonTypeInfo, writer, yamlOptions);
     }
 
     /// <summary>
@@ -383,12 +303,8 @@ public static class YamlSerializer
 
             try
             {
-                using (var writer = new Utf8JsonWriter(buffer))
-                {
-                    JsonSerializer.Serialize(writer, value, jsonTypeInfo);
-                }
-
-                result.Append(JsonToYamlConverter.ConvertToString(buffer.WrittenSpan, documentOptions));
+                JsonToYamlConverter.Serialize(value, jsonTypeInfo, buffer, documentOptions);
+                result.Append(Encoding.UTF8.GetString(buffer.WrittenSpan));
             }
             finally
             {
@@ -524,23 +440,18 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
-        var buffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var writer = new Utf8JsonWriter(buffer))
+        return DeserializeFromPipe(
+            output =>
             {
-                using var reader = CreateStrictUtf8StreamReader(stream);
-                var parser = CreateParser(reader, yamlOptions);
-                YamlToJsonConverter.Convert(parser, writer, yamlOptions);
-            }
-
-            return JsonSerializer.Deserialize(buffer.WrittenSpan, jsonTypeInfo);
-        }
-        finally
-        {
-            buffer.Dispose();
-        }
+                using (var writer = new Utf8JsonWriter(output))
+                {
+                    using var reader = CreateStrictUtf8StreamReader(stream);
+                    var parser = CreateParser(reader, yamlOptions);
+                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                }
+            },
+            json => JsonSerializer.Deserialize(json.Span, jsonTypeInfo),
+            jsonStream => JsonSerializer.Deserialize(jsonStream, jsonTypeInfo));
     }
 
     /// <summary>
@@ -561,23 +472,18 @@ public static class YamlSerializer
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        var buffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var writer = new Utf8JsonWriter(buffer))
+        return DeserializeFromPipe(
+            output =>
             {
-                using var reader = CreateStrictUtf8StreamReader(stream);
-                var parser = CreateParser(reader, yamlOptions);
-                YamlToJsonConverter.Convert(parser, writer, yamlOptions);
-            }
-
-            return JsonSerializer.Deserialize<T>(buffer.WrittenSpan, jsonOptions);
-        }
-        finally
-        {
-            buffer.Dispose();
-        }
+                using (var writer = new Utf8JsonWriter(output))
+                {
+                    using var reader = CreateStrictUtf8StreamReader(stream);
+                    var parser = CreateParser(reader, yamlOptions);
+                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                }
+            },
+            json => JsonSerializer.Deserialize<T>(json.Span, jsonOptions),
+            jsonStream => JsonSerializer.Deserialize<T>(jsonStream, jsonOptions));
     }
 
     /// <summary>
@@ -765,8 +671,10 @@ public static class YamlSerializer
     /// provided System.Text.Json contract.
     /// </summary>
     /// <remarks>
-    /// The stream write is asynchronous and honors <paramref name="cancellationToken"/>. Object
-    /// serialization and YAML conversion are synchronous CPU work.
+    /// Small YAML results are staged in pooled memory; results exceeding the bounded staging
+    /// limit spill incrementally through a pipe. The stream write is asynchronous and honors
+    /// <paramref name="cancellationToken"/>; object serialization and YAML conversion are
+    /// synchronous CPU work subject to destination backpressure.
     /// </remarks>
     /// <typeparam name="T">The type of the value to serialize.</typeparam>
     /// <param name="stream">The stream to write YAML to. The stream is not closed or disposed.</param>
@@ -781,40 +689,20 @@ public static class YamlSerializer
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(jsonTypeInfo);
 
-        var jsonBuffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
-            {
-                JsonSerializer.Serialize(jsonWriter, value, jsonTypeInfo);
-            }
-
-            var yamlBuffer = new PooledBufferWriter();
-
-            try
-            {
-                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
-
-                await stream.WriteAsync(yamlBuffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                yamlBuffer.Dispose();
-            }
-        }
-        finally
-        {
-            jsonBuffer.Dispose();
-        }
+        await SerializeToPipeAsync(
+            stream,
+            output => JsonToYamlConverter.Serialize(value, jsonTypeInfo, output, yamlOptions),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Serializes the specified value as YAML to the provided stream asynchronously.
     /// </summary>
     /// <remarks>
-    /// The stream write is asynchronous and honors <paramref name="cancellationToken"/>. Object
-    /// serialization and YAML conversion are synchronous CPU work.
+    /// Small YAML results are staged in pooled memory; results exceeding the bounded staging
+    /// limit spill incrementally through a pipe. The stream write is asynchronous and honors
+    /// <paramref name="cancellationToken"/>; object serialization and YAML conversion are
+    /// synchronous CPU work subject to destination backpressure.
     /// </remarks>
     /// <typeparam name="T">The type of the value to serialize.</typeparam>
     /// <param name="stream">The stream to write YAML to. The stream is not closed or disposed.</param>
@@ -830,32 +718,10 @@ public static class YamlSerializer
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        var jsonBuffer = new PooledBufferWriter();
-
-        try
-        {
-            using (var jsonWriter = new Utf8JsonWriter(jsonBuffer))
-            {
-                JsonSerializer.Serialize(jsonWriter, value, jsonOptions);
-            }
-
-            var yamlBuffer = new PooledBufferWriter();
-
-            try
-            {
-                JsonToYamlConverter.Convert(jsonBuffer.WrittenSpan, yamlBuffer, yamlOptions);
-
-                await stream.WriteAsync(yamlBuffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                yamlBuffer.Dispose();
-            }
-        }
-        finally
-        {
-            jsonBuffer.Dispose();
-        }
+        await SerializeToPipeAsync(
+            stream,
+            output => JsonToYamlConverter.Serialize(value, jsonOptions, output, yamlOptions),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -889,9 +755,10 @@ public static class YamlSerializer
     /// provided System.Text.Json contract.
     /// </summary>
     /// <remarks>
-    /// The stream read is asynchronous and honors <paramref name="cancellationToken"/>. YAML
-    /// parsing and object deserialization are synchronous CPU work performed after the stream has
-    /// been read.
+    /// The YAML input is staged in pooled UTF-8 buffers because YamlDotNet's parser is synchronous.
+    /// Small converted JSON results are staged in pooled memory; larger results flow through a
+    /// bounded pipe to JSON deserialization. Stream reads honor
+    /// <paramref name="cancellationToken"/>.
     /// </remarks>
     /// <typeparam name="T">The type of the value to deserialize.</typeparam>
     /// <param name="stream">The stream to read YAML from. The stream is not closed or disposed.</param>
@@ -916,23 +783,19 @@ public static class YamlSerializer
         {
             await stream.CopyToAsync(new PooledBufferStream(yamlBuffer), cancellationToken).ConfigureAwait(false);
 
-            var buffer = new PooledBufferWriter();
-
-            try
-            {
-                using (var writer = new Utf8JsonWriter(buffer))
+            return await DeserializeFromPipeAsync(
+                output =>
                 {
-                    using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
-                    var parser = CreateParser(reader, yamlOptions);
-                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
-                }
-
-                return JsonSerializer.Deserialize(buffer.WrittenSpan, jsonTypeInfo);
-            }
-            finally
-            {
-                buffer.Dispose();
-            }
+                    using (var writer = new Utf8JsonWriter(output))
+                    {
+                        using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
+                        var parser = CreateParser(reader, yamlOptions);
+                        YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                    }
+                },
+                json => JsonSerializer.Deserialize(json.Span, jsonTypeInfo),
+                (jsonStream, token) => JsonSerializer.DeserializeAsync(jsonStream, jsonTypeInfo, token),
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -945,9 +808,10 @@ public static class YamlSerializer
     /// of type <typeparamref name="T"/>.
     /// </summary>
     /// <remarks>
-    /// The stream read is asynchronous and honors <paramref name="cancellationToken"/>. YAML
-    /// parsing and object deserialization are synchronous CPU work performed after the stream has
-    /// been read.
+    /// The YAML input is staged in pooled UTF-8 buffers because YamlDotNet's parser is synchronous.
+    /// Small converted JSON results are staged in pooled memory; larger results flow through a
+    /// bounded pipe to JSON deserialization. Stream reads honor
+    /// <paramref name="cancellationToken"/>.
     /// </remarks>
     /// <typeparam name="T">The type of the value to deserialize.</typeparam>
     /// <param name="stream">The stream to read YAML from. The stream is not closed or disposed.</param>
@@ -969,23 +833,19 @@ public static class YamlSerializer
         {
             await stream.CopyToAsync(new PooledBufferStream(yamlBuffer), cancellationToken).ConfigureAwait(false);
 
-            var buffer = new PooledBufferWriter();
-
-            try
-            {
-                using (var writer = new Utf8JsonWriter(buffer))
+            return await DeserializeFromPipeAsync(
+                output =>
                 {
-                    using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
-                    var parser = CreateParser(reader, yamlOptions);
-                    YamlToJsonConverter.Convert(parser, writer, yamlOptions);
-                }
-
-                return JsonSerializer.Deserialize<T>(buffer.WrittenSpan, jsonOptions);
-            }
-            finally
-            {
-                buffer.Dispose();
-            }
+                    using (var writer = new Utf8JsonWriter(output))
+                    {
+                        using var reader = new SequenceTextReader(yamlBuffer.WrittenMemory, cancellationToken);
+                        var parser = CreateParser(reader, yamlOptions);
+                        YamlToJsonConverter.Convert(parser, writer, yamlOptions);
+                    }
+                },
+                json => JsonSerializer.Deserialize<T>(json.Span, jsonOptions),
+                (jsonStream, token) => JsonSerializer.DeserializeAsync<T>(jsonStream, jsonOptions, token),
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1042,6 +902,354 @@ public static class YamlSerializer
     }
 
     #endregion
+
+    private const int InMemoryJsonThreshold = 128 * 1024;
+
+    private static Pipe CreateBoundedPipe() => new(new PipeOptions(
+        pauseWriterThreshold: 64 * 1024,
+        resumeWriterThreshold: 32 * 1024,
+        minimumSegmentSize: 4096,
+        useSynchronizationContext: false));
+
+    private static T? DeserializeFromPipe<T>(
+        Action<IBufferWriter<byte>> convertYaml,
+        Func<ReadOnlyMemory<byte>, T?> deserializeBufferedJson,
+        Func<Stream, T?> deserializeJsonStream)
+    {
+        Pipe? pipe = null;
+        Task<T?>? deserializeTask = null;
+        var writerCompleted = false;
+
+        using var output = new ThresholdBufferWriter(InMemoryJsonThreshold, () =>
+        {
+            pipe = CreateBoundedPipe();
+            var currentPipe = pipe;
+            deserializeTask = Task.Run(() =>
+            {
+                using var jsonStream = currentPipe.Reader.AsStream(leaveOpen: true);
+                var result = deserializeJsonStream(jsonStream);
+                DrainSynchronously(jsonStream);
+                return result;
+            });
+
+            return new PipeBufferWriter(currentPipe.Writer);
+        });
+
+        try
+        {
+            try
+            {
+                convertYaml(output);
+                output.Flush();
+            }
+            catch (Exception exception)
+            {
+                if (pipe is not null)
+                {
+                    pipe.Writer.CancelPendingFlush();
+                    pipe.Writer.Complete(exception);
+                    writerCompleted = true;
+
+                    try
+                    {
+                        deserializeTask!.GetAwaiter().GetResult();
+                    }
+                    catch
+                    {
+                        // Preserve the YAML conversion failure, which precedes JSON deserialization.
+                    }
+                }
+
+                ExceptionDispatchInfo.Capture(exception).Throw();
+                throw;
+            }
+
+            if (pipe is null)
+            {
+                return deserializeBufferedJson(output.WrittenMemory);
+            }
+
+            pipe.Writer.Complete();
+            writerCompleted = true;
+            return deserializeTask!.GetAwaiter().GetResult();
+        }
+        finally
+        {
+            if (pipe is not null)
+            {
+                if (!writerCompleted)
+                {
+                    pipe.Writer.Complete();
+                }
+
+                pipe.Reader.Complete();
+            }
+        }
+    }
+
+    private static void DrainSynchronously(Stream stream)
+    {
+        Span<byte> buffer = stackalloc byte[4096];
+        while (stream.Read(buffer) != 0)
+        {
+        }
+    }
+
+    private sealed class PipeCopyState
+    {
+        public Exception? DestinationException { get; set; }
+    }
+
+    private static async Task SerializeToPipeAsync(
+        Stream destination,
+        Action<IBufferWriter<byte>> serialize,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Pipe? pipe = null;
+        PipeCopyState? copyState = null;
+        Task? copyTask = null;
+        var writerCompleted = false;
+        using var output = new ThresholdBufferWriter(InMemoryJsonThreshold, () =>
+        {
+            pipe = CreateBoundedPipe();
+            copyState = new PipeCopyState();
+            copyTask = CopyPipeToStreamAsync(pipe.Reader, destination, cancellationToken, copyState);
+            return new PipeBufferWriter(pipe.Writer, cancellationToken);
+        });
+
+        try
+        {
+            serialize(output);
+            output.Flush();
+
+            if (pipe is null)
+            {
+                await destination.WriteAsync(output.WrittenMemory, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            pipe.Writer.Complete();
+            writerCompleted = true;
+            await copyTask!.ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            if (pipe is null)
+            {
+                throw;
+            }
+
+            pipe.Writer.CancelPendingFlush();
+
+            if (!writerCompleted)
+            {
+                pipe.Writer.Complete(exception);
+                writerCompleted = true;
+            }
+
+            try
+            {
+                await copyTask!.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The original conversion or destination exception is rethrown below.
+            }
+
+            ExceptionDispatchInfo.Capture(copyState?.DestinationException ?? exception).Throw();
+            throw;
+        }
+        finally
+        {
+            if (pipe is not null && !writerCompleted)
+            {
+                pipe.Writer.Complete();
+            }
+        }
+    }
+
+    private static async Task CopyPipeToStreamAsync(
+        PipeReader reader,
+        Stream destination,
+        CancellationToken cancellationToken,
+        PipeCopyState copyState)
+    {
+        Exception? completionException = null;
+
+        try
+        {
+            while (true)
+            {
+                var readResult = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+                var buffer = readResult.Buffer;
+
+                try
+                {
+                    if (readResult.IsCanceled)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        throw new OperationCanceledException(cancellationToken);
+                    }
+
+                    foreach (var segment in buffer)
+                    {
+                        if (segment.IsEmpty)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            await destination.WriteAsync(segment, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (Exception exception)
+                        {
+                            copyState.DestinationException = exception;
+                            throw;
+                        }
+                    }
+                }
+                finally
+                {
+                    reader.AdvanceTo(buffer.End);
+                }
+
+                if (readResult.IsCompleted)
+                {
+                    return;
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            completionException = exception;
+            throw;
+        }
+        finally
+        {
+            reader.Complete(completionException);
+        }
+    }
+
+    private static async Task<T?> DeserializeFromPipeAsync<T>(
+        Action<IBufferWriter<byte>> convertYaml,
+        Func<ReadOnlyMemory<byte>, T?> deserializeBufferedJson,
+        Func<Stream, CancellationToken, ValueTask<T?>> deserializeJson,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Pipe? pipe = null;
+        Task<T?>? deserializeTask = null;
+        var writerCompleted = false;
+        using var output = new ThresholdBufferWriter(InMemoryJsonThreshold, () =>
+        {
+            pipe = CreateBoundedPipe();
+            deserializeTask = DeserializeAndDrainAsync(pipe.Reader, deserializeJson, cancellationToken);
+            return new PipeBufferWriter(pipe.Writer, cancellationToken);
+        });
+
+        try
+        {
+            try
+            {
+                convertYaml(output);
+                output.Flush();
+            }
+            catch (Exception exception)
+            {
+                if (pipe is not null)
+                {
+                    pipe.Writer.CancelPendingFlush();
+                    pipe.Writer.Complete(exception);
+                    writerCompleted = true;
+
+                    try
+                    {
+                        await deserializeTask!.ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Preserve the YAML conversion failure, which precedes JSON deserialization.
+                    }
+                }
+
+                ExceptionDispatchInfo.Capture(exception).Throw();
+                throw;
+            }
+
+            if (pipe is null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return deserializeBufferedJson(output.WrittenMemory);
+            }
+
+            pipe.Writer.Complete();
+            writerCompleted = true;
+            return await deserializeTask!.ConfigureAwait(false);
+        }
+        finally
+        {
+            if (pipe is not null)
+            {
+                if (!writerCompleted)
+                {
+                    pipe.Writer.Complete();
+                }
+
+                pipe.Reader.Complete();
+            }
+        }
+    }
+
+    private static async Task<T?> DeserializeAndDrainAsync<T>(
+        PipeReader reader,
+        Func<Stream, CancellationToken, ValueTask<T?>> deserializeJson,
+        CancellationToken cancellationToken)
+    {
+        using var jsonStream = reader.AsStream(leaveOpen: true);
+        T? result;
+
+        try
+        {
+            result = await deserializeJson(jsonStream, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            try
+            {
+                await DrainAsync(jsonStream, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Keep the original JSON deserialization exception. YAML producer errors are
+                // surfaced independently by DeserializeFromPipeAsync.
+            }
+
+            throw;
+        }
+
+        await DrainAsync(jsonStream, cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private static async Task DrainAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(4096);
+
+        try
+        {
+            while (await stream.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false) != 0)
+            {
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
 
     private static StreamReader CreateStrictUtf8StreamReader(Stream stream)
     {

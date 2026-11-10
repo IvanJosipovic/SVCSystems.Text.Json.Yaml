@@ -4,26 +4,33 @@ using System.Text;
 namespace SVCSystems.Text.Json.Yaml.Internal;
 
 /// <summary>
-/// A <see cref="TextWriter"/> that UTF-8 encodes characters directly into an
-/// <see cref="IBufferWriter{T}"/> as they are written, with no intermediate char or byte buffer.
+/// A <see cref="TextWriter"/> that UTF-8 encodes characters into a small pooled byte buffer before
+/// committing them to an <see cref="IBufferWriter{T}"/>. It does not allocate a char buffer.
 /// </summary>
 /// <remarks>
 /// Unpaired surrogates are rejected. A high surrogate held back at the end of one write is
 /// correctly paired with the low surrogate at the start of the next one.
 /// <para>
-/// <see cref="Flush"/> and <see cref="Dispose"/> reject a pending unpaired surrogate. The writer
-/// does not close or dispose the underlying <see cref="IBufferWriter{T}"/>.
+/// <see cref="Flush"/> and <see cref="Dispose"/> reject a pending unpaired surrogate and commit
+/// buffered bytes. The writer does not close or dispose the underlying <see cref="IBufferWriter{T}"/>.
 /// </para>
 /// </remarks>
 internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWriter
 {
+    private const int BufferSize = 4096;
+
     private readonly IBufferWriter<byte> _writer = writer ?? throw new ArgumentNullException(nameof(writer));
+    private byte[]? _buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+    private int _written;
     private char _pendingHighSurrogate;
+    private bool _disposed;
 
     public override Encoding Encoding => JsonToYamlConverter.Utf8NoBom;
 
     public override void Write(char value)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (_pendingHighSurrogate != '\0')
         {
             if (char.IsLowSurrogate(value))
@@ -42,9 +49,11 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
         if (value < 0x80)
         {
-            var span = _writer.GetSpan(1);
-            span[0] = (byte)value;
-            _writer.Advance(1);
+            _buffer![_written++] = (byte)value;
+            if (_written == _buffer.Length)
+            {
+                FlushBuffer();
+            }
         }
         else if (char.IsHighSurrogate(value))
         {
@@ -62,6 +71,8 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
     public override void Write(string? value)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (value is not null && value.Length > 0)
         {
             WriteCore(value.AsSpan());
@@ -70,6 +81,7 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
     public override void Write(char[]? buffer, int index, int count)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(buffer);
         ArgumentOutOfRangeException.ThrowIfNegative(index);
         ArgumentOutOfRangeException.ThrowIfNegative(count);
@@ -81,22 +93,47 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
         }
     }
 
-    public override void Write(ReadOnlySpan<char> buffer) => WriteCore(buffer);
+    public override void Write(ReadOnlySpan<char> buffer)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        WriteCore(buffer);
+    }
 
     public override void Flush()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (_pendingHighSurrogate != '\0')
         {
             _pendingHighSurrogate = '\0';
             throw InvalidSurrogate();
         }
+
+        FlushBuffer();
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (!_disposed)
         {
-            Flush();
+            try
+            {
+                if (disposing)
+                {
+                    Flush();
+                }
+            }
+            finally
+            {
+                if (_buffer is not null)
+                {
+                    ArrayPool<byte>.Shared.Return(_buffer);
+                    _buffer = null;
+                }
+
+                _written = 0;
+                _disposed = true;
+            }
         }
 
         base.Dispose(disposing);
@@ -132,9 +169,23 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
         if (Ascii.IsValid(value))
         {
-            var destination = _writer.GetSpan(value.Length);
-            Ascii.FromUtf16(value, destination, out var written);
-            _writer.Advance(written);
+            if (value.Length >= _buffer!.Length)
+            {
+                FlushBuffer();
+                var destination = _writer.GetSpan(value.Length);
+                Ascii.FromUtf16(value, destination, out var directWritten);
+                _writer.Advance(directWritten);
+                return;
+            }
+
+            if (_buffer.Length - _written < value.Length)
+            {
+                FlushBuffer();
+            }
+
+            var bufferedDestination = _buffer.AsSpan(_written);
+            Ascii.FromUtf16(value, bufferedDestination, out var written);
+            _written += written;
             return;
         }
 
@@ -153,17 +204,42 @@ internal sealed class Utf8BufferTextWriter(IBufferWriter<byte> writer) : TextWri
 
     private void EncodeCore(ReadOnlySpan<char> value)
     {
-        var destination = _writer.GetSpan(JsonToYamlConverter.Utf8NoBom.GetMaxByteCount(value.Length));
-        var written = JsonToYamlConverter.Utf8NoBom.GetBytes(value, destination);
-        _writer.Advance(written);
+        var maxByteCount = JsonToYamlConverter.Utf8NoBom.GetMaxByteCount(value.Length);
+        if (maxByteCount >= _buffer!.Length)
+        {
+            FlushBuffer();
+            var destination = _writer.GetSpan(maxByteCount);
+            var directWritten = JsonToYamlConverter.Utf8NoBom.GetBytes(value, destination);
+            _writer.Advance(directWritten);
+            return;
+        }
+
+        if (_buffer.Length - _written < maxByteCount)
+        {
+            FlushBuffer();
+        }
+
+        var bufferedDestination = _buffer.AsSpan(_written);
+        _written += JsonToYamlConverter.Utf8NoBom.GetBytes(value, bufferedDestination);
     }
 
     private void EncodePair(char high, char low)
     {
         Span<char> pair = [high, low];
-        var destination = _writer.GetSpan(4);
-        var written = JsonToYamlConverter.Utf8NoBom.GetBytes(pair, destination);
-        _writer.Advance(written);
+        EncodeCore(pair);
+    }
+
+    private void FlushBuffer()
+    {
+        if (_written == 0)
+        {
+            return;
+        }
+
+        var destination = _writer.GetSpan(_written);
+        _buffer!.AsSpan(0, _written).CopyTo(destination);
+        _writer.Advance(_written);
+        _written = 0;
     }
 
     private static EncoderFallbackException InvalidSurrogate() =>
